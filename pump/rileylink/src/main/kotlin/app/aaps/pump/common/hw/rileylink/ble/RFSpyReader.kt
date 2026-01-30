@@ -25,6 +25,8 @@ class RFSpyReader internal constructor(private val aapsLogger: AAPSLogger, priva
     private var acquireCount = 0
     private var releaseCount = 0
     private var stopAtNull = true
+    @Volatile
+    private var running = false
     fun setRileyLinkEncodingType(encodingType: RileyLinkEncodingType) {
         aapsLogger.debug("setRileyLinkEncodingType: $encodingType")
         stopAtNull = !(encodingType == RileyLinkEncodingType.Manchester || encodingType == RileyLinkEncodingType.FourByteSixByteRileyLink)
@@ -58,13 +60,23 @@ class RFSpyReader internal constructor(private val aapsLogger: AAPSLogger, priva
     }
 
     fun start() {
+        if (running) {
+            aapsLogger.debug(LTag.PUMPBTCOMM, "RFSpyReader already running")
+            return
+        }
+        running = true
         executor.execute {
             val serviceUUID = UUID.fromString(GattAttributes.SERVICE_RADIO)
             val radioDataUUID = UUID.fromString(GattAttributes.CHARA_RADIO_DATA)
-            while (true) {
+            aapsLogger.debug(LTag.PUMPBTCOMM, "RFSpyReader started")
+            while (running) {
                 try {
                     acquireCount++
                     waitForRadioData.acquire()
+                    if (!running) {
+                        aapsLogger.debug(LTag.PUMPBTCOMM, "RFSpyReader stopping after acquire")
+                        break
+                    }
                     aapsLogger.debug(LTag.PUMPBTCOMM, "${ThreadUtil.sig()}waitForRadioData acquired (count=$acquireCount) at t=${SystemClock.uptimeMillis()}")
                     SystemClock.sleep(1)
                     var result = rileyLinkBle.readCharacteristicBlocking(serviceUUID, radioDataUUID)
@@ -94,6 +106,14 @@ class RFSpyReader internal constructor(private val aapsLogger: AAPSLogger, priva
                     aapsLogger.error(LTag.PUMPBTCOMM, "Interrupted while waiting for data")
                 }
             }
+            aapsLogger.debug(LTag.PUMPBTCOMM, "RFSpyReader stopped")
         }
+    }
+
+    fun stop() {
+        aapsLogger.debug(LTag.PUMPBTCOMM, "Stopping RFSpyReader")
+        running = false
+        waitForRadioData.release() // Unblock acquire() if waiting
+        mDataQueue.clear()
     }
 }
