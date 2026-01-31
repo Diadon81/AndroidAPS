@@ -92,10 +92,10 @@ class RileyLinkBroadcastReceiver : DaggerBroadcastReceiver() {
     private fun processRileyLinkBroadcasts(action: String, context: Context): Boolean =
         when (action) {
             RileyLinkConst.Intents.RileyLinkDisconnected  -> {
-                aapsLogger.warn(LTag.PUMPBTCOMM, "RileyLink disconnected, cleaning up resources")
-                // Stop reader and reset connection to ensure clean state for reconnection
+                aapsLogger.warn(LTag.PUMPBTCOMM, "RileyLink disconnected, stopping reader for clean reconnect")
+                // Stop reader to allow clean restart on reconnect
+                // DON'T call resetConnection() - keep GATT alive for autoConnect to work
                 rileyLinkService?.rfSpy?.stopReader()
-                rileyLinkService?.rileyLinkBLE?.resetConnection()
                 if ((context.getSystemService(Context.BLUETOOTH_SERVICE) as BluetoothManager).adapter.isEnabled)
                     rileyLinkServiceData.setServiceState(RileyLinkServiceState.BluetoothError, RileyLinkError.RileyLinkUnreachable)
                 else

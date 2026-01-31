@@ -432,7 +432,11 @@ class RileyLinkBLE @Inject constructor(
                 } else if (newState == BluetoothProfile.STATE_DISCONNECTED) {
                     rileyLinkUtil.sendBroadcastMessage(RileyLinkConst.Intents.RileyLinkDisconnected)
                     isConnected = false
-                    close()  // Always close GATT on disconnect to ensure clean state for reconnection
+                    // Reset semaphore to prevent deadlock, but DON'T close GATT - keep it for autoConnect
+                    mCurrentOperation = null
+                    gattOperationSema.drainPermits()
+                    gattOperationSema.release()
+                    if (manualDisconnect) close()
                     aapsLogger.warn(LTag.PUMPBTCOMM, "RileyLink Disconnected.")
                 } else {
                     aapsLogger.warn(LTag.PUMPBTCOMM, String.format(Locale.ENGLISH, "Some other state: (status=%d, newState=%d)", status, newState))
