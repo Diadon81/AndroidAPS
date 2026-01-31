@@ -64,6 +64,8 @@ class RFSpyReader internal constructor(private val aapsLogger: AAPSLogger, priva
             aapsLogger.debug(LTag.PUMPBTCOMM, "RFSpyReader already running")
             return
         }
+        // Reset semaphore to clean state before starting
+        waitForRadioData.drainPermits()
         running = true
         executor.execute {
             val serviceUUID = UUID.fromString(GattAttributes.SERVICE_RADIO)
