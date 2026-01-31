@@ -38,8 +38,10 @@ import org.apache.commons.lang3.StringUtils
 import java.util.Locale
 import java.util.UUID
 import java.util.concurrent.Semaphore
+import java.util.concurrent.locks.ReentrantLock
 import javax.inject.Inject
 import javax.inject.Singleton
+import kotlin.concurrent.withLock
 
 /**
  * Created by geoff on 5/26/16.
@@ -57,16 +59,22 @@ class RileyLinkBLE @Inject constructor(
 ) {
 
     private val gattDebugEnabled = true
+    @Volatile
     private var manualDisconnect = false
 
     //val bluetoothAdapter: BluetoothAdapter = BluetoothAdapter.getDefaultAdapter()
     val bluetoothAdapter: BluetoothAdapter? get() = (context.getSystemService(Context.BLUETOOTH_SERVICE) as BluetoothManager?)?.adapter
     private val bluetoothGattCallback: BluetoothGattCallback
     var rileyLinkDevice: BluetoothDevice? = null
+
+    // Lock for thread-safe access to bluetoothConnectionGatt and mCurrentOperation
+    private val gattLock = ReentrantLock()
     private var bluetoothConnectionGatt: BluetoothGatt? = null
+    @Volatile
     private var mCurrentOperation: BLECommOperation? = null
     private val gattOperationSema = Semaphore(1, true)
     private var radioResponseCountNotified: Runnable? = null
+    @Volatile
     var isConnected = false
         private set
 
@@ -174,18 +182,22 @@ class RileyLinkBLE @Inject constructor(
         if (config.PUMPDRIVERS && ContextCompat.checkSelfPermission(context, "android.permission.BLUETOOTH_CONNECT") != PackageManager.PERMISSION_GRANTED) {
             aapsLogger.debug(LTag.PUMPBTCOMM, "no permission")
             return
-        } else bluetoothConnectionGatt = rileyLinkDevice?.connectGatt(context, true, bluetoothGattCallback)
+        }
+        val gatt = rileyLinkDevice?.connectGatt(context, true, bluetoothGattCallback)
+        gattLock.withLock {
+            bluetoothConnectionGatt = gatt
+        }
         // , BluetoothDevice.TRANSPORT_LE
-        if (bluetoothConnectionGatt == null)
+        if (gatt == null)
             aapsLogger.error(LTag.PUMPBTCOMM, "Failed to connect to Bluetooth Low Energy device at " + bluetoothAdapter?.address)
         else {
             if (gattDebugEnabled) aapsLogger.debug(LTag.PUMPBTCOMM, "Gatt Connected.")
-            bluetoothConnectionGatt?.device?.name?.let { deviceName ->
+            gatt.device?.name?.let { deviceName ->
                 // Update stored name upon connecting (also for backwards compatibility for device where a name was not yet stored)
                 if (StringUtils.isNotEmpty(deviceName)) preferences.put(RileyLinkStringKey.Name, deviceName)
                 else preferences.remove(RileyLinkStringKey.Name)
                 rileyLinkServiceData.rileyLinkName = deviceName
-                rileyLinkServiceData.rileyLinkAddress = bluetoothConnectionGatt?.device?.address
+                rileyLinkServiceData.rileyLinkAddress = gatt.device?.address
             }
         }
     }
@@ -195,33 +207,40 @@ class RileyLinkBLE @Inject constructor(
         isConnected = false
         aapsLogger.warn(LTag.PUMPBTCOMM, "Closing GATT connection")
         // Close old connection
-        if (bluetoothConnectionGatt != null) {
-            // Not sure if to disconnect or to close first..
-            bluetoothConnectionGatt?.disconnect()
-            manualDisconnect = true
+        gattLock.withLock {
+            if (bluetoothConnectionGatt != null) {
+                // Not sure if to disconnect or to close first..
+                bluetoothConnectionGatt?.disconnect()
+                manualDisconnect = true
+            }
         }
     }
 
     @SuppressLint("MissingPermission")
     fun close() {
-        bluetoothConnectionGatt?.close()
-        bluetoothConnectionGatt = null
+        gattLock.withLock {
+            bluetoothConnectionGatt?.close()
+            bluetoothConnectionGatt = null
+        }
     }
 
     fun resetConnection() {
         aapsLogger.warn(LTag.PUMPBTCOMM, "Resetting BLE connection state")
         isConnected = false
-        mCurrentOperation = null
-        // Drain and reset semaphore to ensure it's in a clean state
-        gattOperationSema.drainPermits()
-        gattOperationSema.release()
+        gattLock.withLock {
+            mCurrentOperation = null
+            // Drain and reset semaphore atomically to ensure it's in a clean state
+            gattOperationSema.drainPermits()
+            gattOperationSema.release()
+        }
         close()
     }
 
     @SuppressLint("MissingPermission")
     fun setNotificationBlocking(serviceUUID: UUID?, charaUUID: UUID?): BLECommOperationResult {
         val retValue = BLECommOperationResult()
-        if (bluetoothConnectionGatt == null) {
+        val gatt = gattLock.withLock { bluetoothConnectionGatt }
+        if (gatt == null) {
             aapsLogger.error(LTag.PUMPBTCOMM, "setNotification_blocking: not configured!")
             retValue.resultCode = BLECommOperationResult.RESULT_NOT_CONFIGURED
             return retValue
@@ -233,34 +252,32 @@ class RileyLinkBLE @Inject constructor(
                 retValue.resultCode = BLECommOperationResult.RESULT_BUSY
                 return retValue
             }
-            if (bluetoothConnectionGatt?.getService(serviceUUID) == null) {
+            if (gatt.getService(serviceUUID) == null) {
                 // Catch if the service is not supported by the BLE device
                 retValue.resultCode = BLECommOperationResult.RESULT_NONE
                 aapsLogger.error(LTag.PUMPBTCOMM, "BT Device not supported")
                 return retValue
             }
-            bluetoothConnectionGatt?.let { bluetoothConnectionGatt ->
-                val chara = bluetoothConnectionGatt.getService(serviceUUID)?.getCharacteristic(charaUUID)
-                if (chara == null) {
-                    retValue.resultCode = BLECommOperationResult.RESULT_NONE
-                    return retValue
-                }
-                // Tell Android that we want the notifications
-                bluetoothConnectionGatt.setCharacteristicNotification(chara, true)
-                val list = chara.descriptors
-                if (list.isEmpty()) {
-                    retValue.resultCode = BLECommOperationResult.RESULT_NONE
-                    return retValue
-                }
-                if (gattDebugEnabled) for (i in list.indices) aapsLogger.debug(LTag.PUMPBTCOMM, "Found descriptor: " + list[i].toString())
-                // Tell the remote device to send the notifications
-                mCurrentOperation = DescriptorWriteOperation(aapsLogger, bluetoothConnectionGatt, list[0], BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE)
-                mCurrentOperation?.execute(this)
-                when {
-                    mCurrentOperation?.timedOut == true    -> retValue.resultCode = BLECommOperationResult.RESULT_TIMEOUT
-                    mCurrentOperation?.interrupted == true -> retValue.resultCode = BLECommOperationResult.RESULT_INTERRUPTED
-                    else                                   -> retValue.resultCode = BLECommOperationResult.RESULT_SUCCESS
-                }
+            val chara = gatt.getService(serviceUUID)?.getCharacteristic(charaUUID)
+            if (chara == null) {
+                retValue.resultCode = BLECommOperationResult.RESULT_NONE
+                return retValue
+            }
+            // Tell Android that we want the notifications
+            gatt.setCharacteristicNotification(chara, true)
+            val list = chara.descriptors
+            if (list.isEmpty()) {
+                retValue.resultCode = BLECommOperationResult.RESULT_NONE
+                return retValue
+            }
+            if (gattDebugEnabled) for (i in list.indices) aapsLogger.debug(LTag.PUMPBTCOMM, "Found descriptor: " + list[i].toString())
+            // Tell the remote device to send the notifications
+            mCurrentOperation = DescriptorWriteOperation(aapsLogger, gatt, list[0], BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE)
+            mCurrentOperation?.execute(this)
+            when {
+                mCurrentOperation?.timedOut == true    -> retValue.resultCode = BLECommOperationResult.RESULT_TIMEOUT
+                mCurrentOperation?.interrupted == true -> retValue.resultCode = BLECommOperationResult.RESULT_INTERRUPTED
+                else                                   -> retValue.resultCode = BLECommOperationResult.RESULT_SUCCESS
             }
         } finally {
             mCurrentOperation = null
@@ -272,7 +289,8 @@ class RileyLinkBLE @Inject constructor(
     // call from main
     fun writeCharacteristicBlocking(serviceUUID: UUID, charaUUID: UUID, value: ByteArray): BLECommOperationResult {
         val retValue = BLECommOperationResult()
-        if (bluetoothConnectionGatt == null) {
+        val gatt = gattLock.withLock { bluetoothConnectionGatt }
+        if (gatt == null) {
             aapsLogger.error(LTag.PUMPBTCOMM, "writeCharacteristic_blocking: not configured!")
             retValue.resultCode = BLECommOperationResult.RESULT_NOT_CONFIGURED
             return retValue
@@ -285,7 +303,7 @@ class RileyLinkBLE @Inject constructor(
                 retValue.resultCode = BLECommOperationResult.RESULT_BUSY
                 return retValue
             }
-            if (bluetoothConnectionGatt?.getService(serviceUUID) == null) {
+            if (gatt.getService(serviceUUID) == null) {
                 // Catch if the service is not supported by the BLE device
                 // GGW: Tue Jul 12 01:14:01 UTC 2016: This can also happen if the
                 // app that created the bluetoothConnectionGatt has been destroyed/created,
@@ -294,19 +312,17 @@ class RileyLinkBLE @Inject constructor(
                 aapsLogger.error(LTag.PUMPBTCOMM, "BT Device not supported")
                 return retValue
             }
-            bluetoothConnectionGatt?.let { bluetoothConnectionGatt ->
-                val chara = bluetoothConnectionGatt.getService(serviceUUID)?.getCharacteristic(charaUUID)
-                if (chara == null) {
-                    retValue.resultCode = BLECommOperationResult.RESULT_NOT_CONFIGURED
-                    return retValue
-                }
-                mCurrentOperation = CharacteristicWriteOperation(aapsLogger, bluetoothConnectionGatt, chara, value)
-                mCurrentOperation?.execute(this)
-                when {
-                    mCurrentOperation?.timedOut == true    -> retValue.resultCode = BLECommOperationResult.RESULT_TIMEOUT
-                    mCurrentOperation?.interrupted == true -> retValue.resultCode = BLECommOperationResult.RESULT_INTERRUPTED
-                    else                                   -> retValue.resultCode = BLECommOperationResult.RESULT_SUCCESS
-                }
+            val chara = gatt.getService(serviceUUID)?.getCharacteristic(charaUUID)
+            if (chara == null) {
+                retValue.resultCode = BLECommOperationResult.RESULT_NOT_CONFIGURED
+                return retValue
+            }
+            mCurrentOperation = CharacteristicWriteOperation(aapsLogger, gatt, chara, value)
+            mCurrentOperation?.execute(this)
+            when {
+                mCurrentOperation?.timedOut == true    -> retValue.resultCode = BLECommOperationResult.RESULT_TIMEOUT
+                mCurrentOperation?.interrupted == true -> retValue.resultCode = BLECommOperationResult.RESULT_INTERRUPTED
+                else                                   -> retValue.resultCode = BLECommOperationResult.RESULT_SUCCESS
             }
         } finally {
             mCurrentOperation = null
@@ -317,7 +333,8 @@ class RileyLinkBLE @Inject constructor(
 
     fun readCharacteristicBlocking(serviceUUID: UUID?, charaUUID: UUID?): BLECommOperationResult {
         val retValue = BLECommOperationResult()
-        if (bluetoothConnectionGatt == null) {
+        val gatt = gattLock.withLock { bluetoothConnectionGatt }
+        if (gatt == null) {
             aapsLogger.error(LTag.PUMPBTCOMM, "readCharacteristic_blocking: not configured!")
             retValue.resultCode = BLECommOperationResult.RESULT_NOT_CONFIGURED
             return retValue
@@ -330,18 +347,18 @@ class RileyLinkBLE @Inject constructor(
                 retValue.resultCode = BLECommOperationResult.RESULT_BUSY
                 return retValue
             }
-            if (bluetoothConnectionGatt?.getService(serviceUUID) == null) {
+            if (gatt.getService(serviceUUID) == null) {
                 // Catch if the service is not supported by the BLE device
                 retValue.resultCode = BLECommOperationResult.RESULT_NONE
                 aapsLogger.error(LTag.PUMPBTCOMM, "BT Device not supported")
                 return retValue
             }
-            val chara = bluetoothConnectionGatt?.getService(serviceUUID)?.getCharacteristic(charaUUID)
+            val chara = gatt.getService(serviceUUID)?.getCharacteristic(charaUUID)
             if (chara == null) {
                 retValue.resultCode = BLECommOperationResult.RESULT_NOT_CONFIGURED
                 return retValue
             }
-            mCurrentOperation = CharacteristicReadOperation(aapsLogger, bluetoothConnectionGatt!!, chara)
+            mCurrentOperation = CharacteristicReadOperation(aapsLogger, gatt, chara)
             mCurrentOperation?.execute(this)
             when {
                 mCurrentOperation?.timedOut == true    -> retValue.resultCode = BLECommOperationResult.RESULT_TIMEOUT
@@ -432,10 +449,12 @@ class RileyLinkBLE @Inject constructor(
                 } else if (newState == BluetoothProfile.STATE_DISCONNECTED) {
                     rileyLinkUtil.sendBroadcastMessage(RileyLinkConst.Intents.RileyLinkDisconnected)
                     isConnected = false
-                    // Reset semaphore to prevent deadlock, but DON'T close GATT - keep it for autoConnect
-                    mCurrentOperation = null
-                    gattOperationSema.drainPermits()
-                    gattOperationSema.release()
+                    // Reset semaphore atomically to prevent deadlock, but DON'T close GATT - keep it for autoConnect
+                    gattLock.withLock {
+                        mCurrentOperation = null
+                        gattOperationSema.drainPermits()
+                        gattOperationSema.release()
+                    }
                     if (manualDisconnect) close()
                     aapsLogger.warn(LTag.PUMPBTCOMM, "RileyLink Disconnected.")
                 } else {

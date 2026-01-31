@@ -30,6 +30,11 @@ class OrangeLinkImpl @Inject constructor(
 
     fun onCharacteristicChanged(characteristic: BluetoothGattCharacteristic, data: ByteArray) {
         if (characteristic.uuid.toString() == GattAttributes.CHARA_NOTIFICATION_ORANGE) {
+            // Validate data array has enough bytes before accessing indices
+            if (data.size < 7) {
+                aapsLogger.error(LTag.PUMPBTCOMM, "OrangeLinkImpl: onCharacteristicChanged received incomplete data, size=${data.size}, expected at least 7 bytes")
+                return
+            }
             val first = 0xff and data[0].toInt()
             aapsLogger.info(LTag.PUMPBTCOMM, "OrangeLinkImpl: onCharacteristicChanged ${ByteUtil.shortHexString(data)}=====$first")
             val fv = data[3].toString() + "." + data[4]
@@ -91,14 +96,13 @@ class OrangeLinkImpl @Inject constructor(
             aapsLogger.debug(LTag.PUMPBTCOMM, "startScan")
             handler.sendEmptyMessageDelayed(TIME_OUT_WHAT, TIME_OUT.toLong())
             val bluetoothLeScanner = rileyLinkBLE.bluetoothAdapter?.bluetoothLeScanner
-            // if (bluetoothLeScanner == null) {
-            //     bluetoothAdapter.startLeScan(mLeScanCallback)
-            //     return
-            // }
-            bluetoothLeScanner?.startScan(buildScanFilters(), buildScanSettings(), scanCallback)
+            if (bluetoothLeScanner == null) {
+                aapsLogger.error(LTag.PUMPBTCOMM, "BluetoothLeScanner not available")
+                return
+            }
+            bluetoothLeScanner.startScan(buildScanFilters(), buildScanSettings(), scanCallback)
         } catch (e: Exception) {
-            e.printStackTrace()
-            aapsLogger.error(LTag.PUMPBTCOMM, "Start scan: ${e.message}", e)
+            aapsLogger.error(LTag.PUMPBTCOMM, "Start scan failed: ${e.message}", e)
         }
     }
 
@@ -120,17 +124,29 @@ class OrangeLinkImpl @Inject constructor(
 
         override fun onScanFailed(errorCode: Int) {
             super.onScanFailed(errorCode)
+            aapsLogger.error(LTag.PUMPBTCOMM, "BLE scan failed with error code: $errorCode")
             stopScan()
         }
     }
 
-    private val handler: Handler = object : Handler(HandlerThread(this::class.java.simpleName + "Handler").also { it.start() }.looper) {
+    // Store reference to HandlerThread for proper cleanup
+    private val handlerThread: HandlerThread = HandlerThread(this::class.java.simpleName + "Handler").also { it.start() }
+
+    private val handler: Handler = object : Handler(handlerThread.looper) {
         override fun handleMessage(msg: Message) {
             super.handleMessage(msg)
             when (msg.what) {
                 TIME_OUT_WHAT -> stopScan()
             }
         }
+    }
+
+    /**
+     * Clean up resources. Call this when OrangeLinkImpl is no longer needed.
+     */
+    fun cleanup() {
+        stopScan()
+        handlerThread.quitSafely()
     }
 
     fun stopScan() {

@@ -9,24 +9,28 @@ import app.aaps.pump.common.hw.rileylink.ble.data.GattAttributes
 import app.aaps.pump.common.hw.rileylink.ble.defs.RileyLinkEncodingType
 import app.aaps.pump.common.hw.rileylink.ble.operations.BLECommOperationResult
 import java.util.UUID
+import java.util.concurrent.ExecutorService
 import java.util.concurrent.Executors
 import java.util.concurrent.LinkedBlockingQueue
 import java.util.concurrent.Semaphore
 import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicInteger
 
 /**
  * Created by geoff on 5/26/16.
  */
 class RFSpyReader internal constructor(private val aapsLogger: AAPSLogger, private val rileyLinkBle: RileyLinkBLE) {
 
-    private var executor = Executors.newSingleThreadExecutor()
+    private var executor: ExecutorService? = null
     private val waitForRadioData = Semaphore(0, true)
     private val mDataQueue = LinkedBlockingQueue<ByteArray>()
-    private var acquireCount = 0
-    private var releaseCount = 0
+    private val acquireCount = AtomicInteger(0)
+    private val releaseCount = AtomicInteger(0)
+    @Volatile
     private var stopAtNull = true
     @Volatile
     private var running = false
+
     fun setRileyLinkEncodingType(encodingType: RileyLinkEncodingType) {
         aapsLogger.debug("setRileyLinkEncodingType: $encodingType")
         stopAtNull = !(encodingType == RileyLinkEncodingType.Manchester || encodingType == RileyLinkEncodingType.FourByteSixByteRileyLink)
@@ -45,8 +49,9 @@ class RFSpyReader internal constructor(private val aapsLogger: AAPSLogger, priva
                 else
                     aapsLogger.debug(LTag.PUMPBTCOMM, "Got data [null] at t==" + SystemClock.uptimeMillis())
                 return dataFromQueue
-            } catch (_: InterruptedException) {
+            } catch (e: InterruptedException) {
                 aapsLogger.error(LTag.PUMPBTCOMM, "poll: Interrupted waiting for data")
+                Thread.currentThread().interrupt() // Restore interrupt status
             }
         }
         return null
@@ -54,8 +59,8 @@ class RFSpyReader internal constructor(private val aapsLogger: AAPSLogger, priva
 
     // Call this from the "response count" notification handler.
     fun newDataIsAvailable() {
-        releaseCount++
-        aapsLogger.debug(LTag.PUMPBTCOMM, "${ThreadUtil.sig()}waitForRadioData released(count=$releaseCount) at t=${SystemClock.uptimeMillis()}")
+        val count = releaseCount.incrementAndGet()
+        aapsLogger.debug(LTag.PUMPBTCOMM, "${ThreadUtil.sig()}waitForRadioData released(count=$count) at t=${SystemClock.uptimeMillis()}")
         waitForRadioData.release()
     }
 
@@ -64,24 +69,28 @@ class RFSpyReader internal constructor(private val aapsLogger: AAPSLogger, priva
             aapsLogger.debug(LTag.PUMPBTCOMM, "RFSpyReader already running")
             return
         }
-        // Reset semaphore to clean state before starting
+        // Reset semaphore and counters to clean state before starting
         waitForRadioData.drainPermits()
+        acquireCount.set(0)
+        releaseCount.set(0)
         running = true
-        executor.execute {
+        // Create a new executor for this session
+        executor = Executors.newSingleThreadExecutor()
+        executor?.execute {
             val serviceUUID = UUID.fromString(GattAttributes.SERVICE_RADIO)
             val radioDataUUID = UUID.fromString(GattAttributes.CHARA_RADIO_DATA)
             aapsLogger.debug(LTag.PUMPBTCOMM, "RFSpyReader started")
             while (running) {
                 try {
-                    acquireCount++
+                    val count = acquireCount.incrementAndGet()
                     waitForRadioData.acquire()
                     if (!running) {
                         aapsLogger.debug(LTag.PUMPBTCOMM, "RFSpyReader stopping after acquire")
                         break
                     }
-                    aapsLogger.debug(LTag.PUMPBTCOMM, "${ThreadUtil.sig()}waitForRadioData acquired (count=$acquireCount) at t=${SystemClock.uptimeMillis()}")
+                    aapsLogger.debug(LTag.PUMPBTCOMM, "${ThreadUtil.sig()}waitForRadioData acquired (count=$count) at t=${SystemClock.uptimeMillis()}")
                     SystemClock.sleep(1)
-                    var result = rileyLinkBle.readCharacteristicBlocking(serviceUUID, radioDataUUID)
+                    val result = rileyLinkBle.readCharacteristicBlocking(serviceUUID, radioDataUUID)
                     SystemClock.sleep(1)
                     if (result.resultCode == BLECommOperationResult.RESULT_SUCCESS) {
                         if (stopAtNull) {
@@ -104,8 +113,10 @@ class RFSpyReader internal constructor(private val aapsLogger: AAPSLogger, priva
                         aapsLogger.error(LTag.PUMPBTCOMM, "FAIL: RileyLinkBLE reports operation already in progress")
                     else if (result.resultCode == BLECommOperationResult.RESULT_NONE)
                         aapsLogger.error(LTag.PUMPBTCOMM, "FAIL: got invalid result code: ${result.resultCode}")
-                } catch (_: InterruptedException) {
+                } catch (e: InterruptedException) {
                     aapsLogger.error(LTag.PUMPBTCOMM, "Interrupted while waiting for data")
+                    Thread.currentThread().interrupt() // Restore interrupt status
+                    break // Exit loop on interrupt
                 }
             }
             aapsLogger.debug(LTag.PUMPBTCOMM, "RFSpyReader stopped")
@@ -117,5 +128,20 @@ class RFSpyReader internal constructor(private val aapsLogger: AAPSLogger, priva
         running = false
         waitForRadioData.release() // Unblock acquire() if waiting
         mDataQueue.clear()
+        // Shutdown executor and wait for termination
+        executor?.let { exec ->
+            exec.shutdown()
+            try {
+                if (!exec.awaitTermination(5, TimeUnit.SECONDS)) {
+                    aapsLogger.warn(LTag.PUMPBTCOMM, "RFSpyReader executor did not terminate in time, forcing shutdown")
+                    exec.shutdownNow()
+                }
+            } catch (e: InterruptedException) {
+                aapsLogger.error(LTag.PUMPBTCOMM, "Interrupted while waiting for executor shutdown")
+                exec.shutdownNow()
+                Thread.currentThread().interrupt()
+            }
+        }
+        executor = null
     }
 }
