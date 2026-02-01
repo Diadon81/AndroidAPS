@@ -249,9 +249,14 @@ class RileyLinkBLE @Inject constructor(
 
         if (gatt == null) {
             aapsLogger.error(LTag.PUMPBTCOMM, "Failed to connect to Bluetooth Low Energy device at ${bluetoothAdapter?.address}")
+            // Start background reconnect since GATT creation failed
+            startBackgroundReconnect()
         } else {
             if (gattDebugEnabled) aapsLogger.debug(LTag.PUMPBTCOMM, "GATT connection initiated (Android ${Build.VERSION.SDK_INT})")
             updateDeviceInfo(gatt)
+            // Schedule timeout for initial connection - critical for Android 12+
+            // Without this, autoConnect=true can wait forever if device is out of range
+            scheduleAutoConnectCheck()
         }
     }
 
