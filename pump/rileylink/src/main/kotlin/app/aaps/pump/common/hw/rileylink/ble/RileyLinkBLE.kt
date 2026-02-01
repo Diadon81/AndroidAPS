@@ -102,10 +102,15 @@ class RileyLinkBLE @Inject constructor(
     var onReconnectNeeded: (() -> Unit)? = null
 
     companion object {
-        private const val AUTO_CONNECT_TIMEOUT_MS = 30_000L
+        // OrangeLink supervision timeout is 5 seconds, so we need to react faster
+        private const val AUTO_CONNECT_TIMEOUT_MS = 10_000L  // Reduced from 30s to match OrangeLink better
         private const val MAX_GATT_133_RETRIES = 3
         private const val GATT_ERROR_133 = 133
         private const val PREFERRED_MTU = 185  // Default BLE MTU is 23, max is 517
+
+        // OrangeLink connection parameters for reference:
+        // MIN_CONN_INTERVAL: 50ms, MAX_CONN_INTERVAL: 100ms
+        // SLAVE_LATENCY: 0, CONN_SUP_TIMEOUT: 5000ms
     }
 
     @Inject fun onInit() {
