@@ -41,6 +41,7 @@ import org.apache.commons.lang3.StringUtils
 import java.util.Locale
 import java.util.UUID
 import java.util.concurrent.Semaphore
+import java.util.concurrent.atomic.AtomicInteger
 import java.util.concurrent.locks.ReentrantLock
 import javax.inject.Inject
 import javax.inject.Singleton
@@ -90,11 +91,12 @@ class RileyLinkBLE @Inject constructor(
 
     // AutoConnect fallback mechanism
     private var lastDisconnectTime: Long = 0
+    private val autoConnectLock = Any()
+    @Volatile
     private var autoConnectCheckRunnable: Runnable? = null
 
-    // GATT 133 retry mechanism
-    @Volatile
-    private var gatt133RetryCount = 0
+    // GATT 133 retry mechanism - use AtomicInteger for thread-safe increment
+    private val gatt133RetryCount = AtomicInteger(0)
 
     // Callback for reconnect in scanning mode
     var onReconnectNeeded: (() -> Unit)? = null
@@ -103,6 +105,7 @@ class RileyLinkBLE @Inject constructor(
         private const val AUTO_CONNECT_TIMEOUT_MS = 30_000L
         private const val MAX_GATT_133_RETRIES = 3
         private const val GATT_ERROR_133 = 133
+        private const val PREFERRED_MTU = 185  // Default BLE MTU is 23, max is 517
     }
 
     @Inject fun onInit() {
@@ -306,32 +309,41 @@ class RileyLinkBLE @Inject constructor(
      * If connection is not restored within timeout, force reconnection.
      */
     private fun scheduleAutoConnectCheck() {
-        cancelAutoConnectCheck()
+        synchronized(autoConnectLock) {
+            cancelAutoConnectCheckInternal()
 
-        val useScanning = preferences.get(RileylinkBooleanPreferenceKey.OrangeUseScanning)
+            val useScanning = preferences.get(RileylinkBooleanPreferenceKey.OrangeUseScanning)
 
-        autoConnectCheckRunnable = Runnable {
-            if (!isConnected && !manualDisconnect) {
-                aapsLogger.warn(LTag.PUMPBTCOMM, "AutoConnect timeout after ${AUTO_CONNECT_TIMEOUT_MS}ms")
+            val runnable = Runnable {
+                if (!isConnected && !manualDisconnect) {
+                    aapsLogger.warn(LTag.PUMPBTCOMM, "AutoConnect timeout after ${AUTO_CONNECT_TIMEOUT_MS}ms")
 
-                if (useScanning) {
-                    // Scanning mode: close GATT and trigger rescan
-                    aapsLogger.info(LTag.PUMPBTCOMM, "Scanning mode: triggering reconnect scan")
-                    close()
-                    onReconnectNeeded?.invoke()
-                } else {
-                    // MAC mode: force direct reconnection
-                    aapsLogger.info(LTag.PUMPBTCOMM, "MAC mode: forcing reconnect")
-                    forceReconnect()
+                    if (useScanning) {
+                        // Scanning mode: close GATT and trigger rescan
+                        aapsLogger.info(LTag.PUMPBTCOMM, "Scanning mode: triggering reconnect scan")
+                        close()
+                        onReconnectNeeded?.invoke()
+                    } else {
+                        // MAC mode: force direct reconnection
+                        aapsLogger.info(LTag.PUMPBTCOMM, "MAC mode: forcing reconnect")
+                        forceReconnect()
+                    }
                 }
             }
-        }
+            autoConnectCheckRunnable = runnable
 
-        mainHandler.postDelayed(autoConnectCheckRunnable!!, AUTO_CONNECT_TIMEOUT_MS)
-        aapsLogger.debug(LTag.PUMPBTCOMM, "Scheduled autoConnect check in ${AUTO_CONNECT_TIMEOUT_MS}ms")
+            mainHandler.postDelayed(runnable, AUTO_CONNECT_TIMEOUT_MS)
+            aapsLogger.debug(LTag.PUMPBTCOMM, "Scheduled autoConnect check in ${AUTO_CONNECT_TIMEOUT_MS}ms")
+        }
     }
 
     private fun cancelAutoConnectCheck() {
+        synchronized(autoConnectLock) {
+            cancelAutoConnectCheckInternal()
+        }
+    }
+
+    private fun cancelAutoConnectCheckInternal() {
         autoConnectCheckRunnable?.let {
             mainHandler.removeCallbacks(it)
             aapsLogger.debug(LTag.PUMPBTCOMM, "Cancelled autoConnect check")
@@ -349,20 +361,44 @@ class RileyLinkBLE @Inject constructor(
         }, 1000)
     }
 
+    // ===== Connection Optimization =====
+
+    /**
+     * Request higher MTU for better throughput (Android 5+).
+     * Default BLE MTU is 23 bytes, we request more for efficiency.
+     */
+    @SuppressLint("MissingPermission")
+    private fun requestMtu() {
+        gattLock.withLock {
+            bluetoothConnectionGatt?.requestMtu(PREFERRED_MTU)
+        }
+    }
+
+    /**
+     * Request high priority connection for lower latency (Android 5+).
+     * Important for time-sensitive pump communication.
+     */
+    @SuppressLint("MissingPermission")
+    private fun requestHighPriority() {
+        gattLock.withLock {
+            bluetoothConnectionGatt?.requestConnectionPriority(BluetoothGatt.CONNECTION_PRIORITY_HIGH)
+        }
+    }
+
     // ===== GATT 133 Retry Mechanism =====
 
     /**
      * Handle GATT error 133 with exponential backoff retry.
      */
     private fun handleGatt133Error() {
-        gatt133RetryCount++
-        aapsLogger.error(LTag.PUMPBTCOMM, "GATT 133 error (attempt $gatt133RetryCount/$MAX_GATT_133_RETRIES)")
+        val retryCount = gatt133RetryCount.incrementAndGet()
+        aapsLogger.error(LTag.PUMPBTCOMM, "GATT 133 error (attempt $retryCount/$MAX_GATT_133_RETRIES)")
 
         close()
 
-        if (gatt133RetryCount < MAX_GATT_133_RETRIES) {
+        if (retryCount < MAX_GATT_133_RETRIES) {
             // Exponential backoff: 1s, 2s, 4s
-            val delay = (1000L * (1 shl (gatt133RetryCount - 1))).coerceAtMost(5000L)
+            val delay = (1000L * (1 shl (retryCount - 1))).coerceAtMost(5000L)
             aapsLogger.info(LTag.PUMPBTCOMM, "Retrying connection in ${delay}ms")
 
             mainHandler.postDelayed({
@@ -376,7 +412,7 @@ class RileyLinkBLE @Inject constructor(
                 }
             }, delay)
         } else {
-            gatt133RetryCount = 0
+            gatt133RetryCount.set(0)
             aapsLogger.error(LTag.PUMPBTCOMM, "GATT 133 error: max retries exceeded")
             rileyLinkServiceData.setServiceState(
                 RileyLinkServiceState.RileyLinkError,
@@ -658,9 +694,12 @@ class RileyLinkBLE @Inject constructor(
                 when (newState) {
                     BluetoothProfile.STATE_CONNECTED -> {
                         cancelAutoConnectCheck()
-                        gatt133RetryCount = 0  // Reset on successful connection
+                        gatt133RetryCount.set(0)  // Reset on successful connection
 
                         if (status == BluetoothGatt.GATT_SUCCESS) {
+                            // Request connection optimizations before service discovery
+                            requestHighPriority()
+                            requestMtu()
                             rileyLinkUtil.sendBroadcastMessage(RileyLinkConst.Intents.BluetoothConnected)
                         } else {
                             aapsLogger.debug(LTag.PUMPBTCOMM,
@@ -701,24 +740,57 @@ class RileyLinkBLE @Inject constructor(
                 }
             }
 
-            @Suppress("DEPRECATION")
+            // ===== Android 13+ (API 33) callback with value parameter =====
+
+            override fun onDescriptorWrite(
+                gatt: BluetoothGatt,
+                descriptor: BluetoothGattDescriptor,
+                status: Int,
+                value: ByteArray
+            ) {
+                handleDescriptorWrite(descriptor, status, value)
+            }
+
+            @Suppress("DEPRECATION", "OVERRIDE_DEPRECATION")
             override fun onDescriptorWrite(gatt: BluetoothGatt, descriptor: BluetoothGattDescriptor, status: Int) {
                 super.onDescriptorWrite(gatt, descriptor, status)
+                // Legacy callback for Android < 13
+                handleDescriptorWrite(descriptor, status, descriptor.value ?: ByteArray(0))
+            }
+
+            private fun handleDescriptorWrite(descriptor: BluetoothGattDescriptor, status: Int, value: ByteArray) {
                 if (gattDebugEnabled) {
                     aapsLogger.warn(LTag.PUMPBTCOMM,
                         "onDescriptorWrite ${GattAttributes.lookup(descriptor.uuid)} " +
-                        "${getGattStatusMessage(status)} written: ${ByteUtil.getHex(descriptor.value)}")
+                        "${getGattStatusMessage(status)} written: ${ByteUtil.getHex(value)}")
                 }
-                mCurrentOperation?.gattOperationCompletionCallback(descriptor.uuid, descriptor.value ?: ByteArray(0))
+                mCurrentOperation?.gattOperationCompletionCallback(descriptor.uuid, value)
+            }
+
+            // ===== Android 13+ (API 33) callback with value parameter =====
+
+            override fun onDescriptorRead(
+                gatt: BluetoothGatt,
+                descriptor: BluetoothGattDescriptor,
+                status: Int,
+                value: ByteArray
+            ) {
+                handleDescriptorRead(descriptor, status, value)
             }
 
             @Suppress("OVERRIDE_DEPRECATION", "DEPRECATION")
             override fun onDescriptorRead(gatt: BluetoothGatt, descriptor: BluetoothGattDescriptor, status: Int) {
                 super.onDescriptorRead(gatt, descriptor, status)
-                mCurrentOperation?.gattOperationCompletionCallback(descriptor.uuid, descriptor.value ?: ByteArray(0))
+                // Legacy callback for Android < 13
+                handleDescriptorRead(descriptor, status, descriptor.value ?: ByteArray(0))
+            }
+
+            private fun handleDescriptorRead(descriptor: BluetoothGattDescriptor, status: Int, value: ByteArray) {
                 if (gattDebugEnabled) {
-                    aapsLogger.warn(LTag.PUMPBTCOMM, "onDescriptorRead ${getGattStatusMessage(status)} $descriptor")
+                    aapsLogger.warn(LTag.PUMPBTCOMM,
+                        "onDescriptorRead ${getGattStatusMessage(status)} ${GattAttributes.lookup(descriptor.uuid)}: ${ByteUtil.getHex(value)}")
                 }
+                mCurrentOperation?.gattOperationCompletionCallback(descriptor.uuid, value)
             }
 
             override fun onMtuChanged(gatt: BluetoothGatt, mtu: Int, status: Int) {

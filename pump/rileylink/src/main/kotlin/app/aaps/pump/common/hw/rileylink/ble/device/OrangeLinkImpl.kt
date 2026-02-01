@@ -154,6 +154,17 @@ class OrangeLinkImpl @Inject constructor(
             return
         }
 
+        // Verify we have an address to scan for
+        val address = rileyLinkServiceData.rileyLinkAddress
+        if (address.isNullOrEmpty()) {
+            aapsLogger.error(LTag.PUMPBTCOMM, "Cannot start scan - no RileyLink address configured")
+            rileyLinkServiceData.setServiceState(
+                RileyLinkServiceState.BluetoothError,
+                RileyLinkError.NoBluetoothAdapter
+            )
+            return
+        }
+
         try {
             stopScanInternal()
 
@@ -175,7 +186,7 @@ class OrangeLinkImpl @Inject constructor(
 
             scanner.startScan(filters, settings, scanCallback)
             aapsLogger.info(LTag.PUMPBTCOMM,
-                "BLE scan started for address: ${rileyLinkServiceData.rileyLinkAddress}")
+                "BLE scan started for address: $address")
 
         } catch (e: Exception) {
             aapsLogger.error(LTag.PUMPBTCOMM, "startScan exception: ${e.message}", e)

@@ -69,10 +69,11 @@ class RFSpyReader internal constructor(private val aapsLogger: AAPSLogger, priva
             aapsLogger.debug(LTag.PUMPBTCOMM, "RFSpyReader already running")
             return
         }
-        // Reset semaphore and counters to clean state before starting
+        // Reset all state to clean before starting
         waitForRadioData.drainPermits()
         acquireCount.set(0)
         releaseCount.set(0)
+        mDataQueue.clear()  // Clear any stale data from previous sessions
         running = true
         // Create a new executor for this session
         executor = Executors.newSingleThreadExecutor()
