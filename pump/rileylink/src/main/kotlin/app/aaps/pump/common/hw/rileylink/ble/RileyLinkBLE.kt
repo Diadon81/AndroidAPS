@@ -109,6 +109,12 @@ class RileyLinkBLE @Inject constructor(
     private val backgroundReconnectLock = Any()
     private var backgroundReconnectAttempt = 0
 
+    // ===== Service Discovery Timeout =====
+    // On Android 12+ service discovery can hang without callback
+    @Volatile
+    private var serviceDiscoveryTimeoutRunnable: Runnable? = null
+    private val serviceDiscoveryLock = Any()
+
     companion object {
         // OrangeLink supervision timeout is 5 seconds, so we need to react faster
         private const val AUTO_CONNECT_TIMEOUT_MS = 10_000L  // Reduced from 30s to match OrangeLink better
@@ -120,6 +126,9 @@ class RileyLinkBLE @Inject constructor(
         // Uses exponential backoff: 10s, 20s, 30s (capped) - balanced for medical device responsiveness
         private const val BACKGROUND_RECONNECT_INITIAL_DELAY_MS = 10_000L
         private const val BACKGROUND_RECONNECT_MAX_DELAY_MS = 30_000L
+
+        // Service discovery timeout - if onServicesDiscovered not called within this time, retry
+        private const val SERVICE_DISCOVERY_TIMEOUT_MS = 15_000L
 
         // OrangeLink connection parameters for reference:
         // MIN_CONN_INTERVAL: 50ms, MAX_CONN_INTERVAL: 100ms
@@ -170,14 +179,53 @@ class RileyLinkBLE @Inject constructor(
 
     @SuppressLint("MissingPermission")
     fun discoverServices(): Boolean {
-        bluetoothConnectionGatt ?: return false
+        val gatt = gattLock.withLock { bluetoothConnectionGatt }
+        if (gatt == null) {
+            aapsLogger.error(LTag.PUMPBTCOMM, "discoverServices: bluetoothConnectionGatt is null!")
+            return false
+        }
 
-        return if (bluetoothConnectionGatt?.discoverServices() == true) {
+        return if (gatt.discoverServices()) {
             aapsLogger.warn(LTag.PUMPBTCOMM, "Starting to discover GATT Services.")
+            // Schedule timeout - if onServicesDiscovered not called, retry connection
+            scheduleServiceDiscoveryTimeout()
             true
         } else {
             aapsLogger.error(LTag.PUMPBTCOMM, "Cannot discover GATT Services.")
             false
+        }
+    }
+
+    private fun scheduleServiceDiscoveryTimeout() {
+        synchronized(serviceDiscoveryLock) {
+            cancelServiceDiscoveryTimeout()
+
+            val runnable = Runnable {
+                if (!isConnected) {
+                    aapsLogger.error(LTag.PUMPBTCOMM,
+                        "Service discovery timeout after ${SERVICE_DISCOVERY_TIMEOUT_MS}ms - retrying connection")
+                    rileyLinkServiceData.setServiceState(
+                        RileyLinkServiceState.BluetoothError,
+                        RileyLinkError.RileyLinkUnreachable
+                    )
+                    // Close and retry
+                    close()
+                    startBackgroundReconnect()
+                }
+            }
+            serviceDiscoveryTimeoutRunnable = runnable
+            mainHandler.postDelayed(runnable, SERVICE_DISCOVERY_TIMEOUT_MS)
+            aapsLogger.debug(LTag.PUMPBTCOMM, "Service discovery timeout scheduled in ${SERVICE_DISCOVERY_TIMEOUT_MS}ms")
+        }
+    }
+
+    private fun cancelServiceDiscoveryTimeout() {
+        synchronized(serviceDiscoveryLock) {
+            serviceDiscoveryTimeoutRunnable?.let {
+                mainHandler.removeCallbacks(it)
+                aapsLogger.debug(LTag.PUMPBTCOMM, "Service discovery timeout cancelled")
+            }
+            serviceDiscoveryTimeoutRunnable = null
         }
     }
 
@@ -555,6 +603,7 @@ class RileyLinkBLE @Inject constructor(
         isConnected = false
         manualDisconnect = true
         cancelAutoConnectCheck()
+        cancelServiceDiscoveryTimeout()
         stopBackgroundReconnect()
         aapsLogger.warn(LTag.PUMPBTCOMM, "Closing GATT connection (manual)")
         gattLock.withLock {
@@ -565,6 +614,7 @@ class RileyLinkBLE @Inject constructor(
     @SuppressLint("MissingPermission")
     fun close() {
         cancelAutoConnectCheck()
+        cancelServiceDiscoveryTimeout()
         gattLock.withLock {
             bluetoothConnectionGatt?.close()
             bluetoothConnectionGatt = null
@@ -916,6 +966,9 @@ class RileyLinkBLE @Inject constructor(
 
             override fun onServicesDiscovered(gatt: BluetoothGatt, status: Int) {
                 super.onServicesDiscovered(gatt, status)
+                // Cancel timeout - we got a response
+                cancelServiceDiscoveryTimeout()
+
                 if (status == BluetoothGatt.GATT_SUCCESS) {
                     val services = gatt.services
                     var rileyLinkFound = false
