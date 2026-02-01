@@ -101,12 +101,25 @@ class RileyLinkBLE @Inject constructor(
     // Callback for reconnect in scanning mode
     var onReconnectNeeded: (() -> Unit)? = null
 
+    // ===== Background Reconnect Mechanism =====
+    // Periodically attempts to reconnect when in error state
+    // This ensures recovery when user returns to BLE range
+    @Volatile
+    private var backgroundReconnectRunnable: Runnable? = null
+    private val backgroundReconnectLock = Any()
+    private var backgroundReconnectAttempt = 0
+
     companion object {
         // OrangeLink supervision timeout is 5 seconds, so we need to react faster
         private const val AUTO_CONNECT_TIMEOUT_MS = 10_000L  // Reduced from 30s to match OrangeLink better
         private const val MAX_GATT_133_RETRIES = 3
         private const val GATT_ERROR_133 = 133
         private const val PREFERRED_MTU = 185  // Default BLE MTU is 23, max is 517
+
+        // Background reconnect: when all retries exhausted but device might come back in range
+        // Uses exponential backoff: 10s, 20s, 30s (capped) - balanced for medical device responsiveness
+        private const val BACKGROUND_RECONNECT_INITIAL_DELAY_MS = 10_000L
+        private const val BACKGROUND_RECONNECT_MAX_DELAY_MS = 30_000L
 
         // OrangeLink connection parameters for reference:
         // MIN_CONN_INTERVAL: 50ms, MAX_CONN_INTERVAL: 100ms
@@ -327,7 +340,9 @@ class RileyLinkBLE @Inject constructor(
                         // Scanning mode: close GATT and trigger rescan
                         aapsLogger.info(LTag.PUMPBTCOMM, "Scanning mode: triggering reconnect scan")
                         close()
-                        onReconnectNeeded?.invoke()
+                        // onReconnectNeeded will trigger scan which has its own retry logic
+                        // If scan fails completely, it will start background reconnect
+                        onReconnectNeeded?.invoke() ?: startBackgroundReconnect()
                     } else {
                         // MAC mode: force direct reconnection
                         aapsLogger.info(LTag.PUMPBTCOMM, "MAC mode: forcing reconnect")
@@ -364,6 +379,108 @@ class RileyLinkBLE @Inject constructor(
                 connectGattInternal()
             }
         }, 1000)
+    }
+
+    // ===== Background Reconnect - recovery when returning to BLE range =====
+
+    /**
+     * Start background reconnect attempts.
+     * Called when all immediate retries are exhausted but we want to keep trying
+     * in case the user returns to BLE range (e.g., came back home).
+     */
+    fun startBackgroundReconnect() {
+        synchronized(backgroundReconnectLock) {
+            if (backgroundReconnectRunnable != null) {
+                aapsLogger.debug(LTag.PUMPBTCOMM, "Background reconnect already running")
+                return
+            }
+
+            if (manualDisconnect) {
+                aapsLogger.debug(LTag.PUMPBTCOMM, "Manual disconnect - not starting background reconnect")
+                return
+            }
+
+            backgroundReconnectAttempt = 0
+            scheduleBackgroundReconnect()
+        }
+    }
+
+    private fun scheduleBackgroundReconnect() {
+        synchronized(backgroundReconnectLock) {
+            if (manualDisconnect || isConnected) {
+                stopBackgroundReconnect()
+                return
+            }
+
+            // Exponential backoff: 30s, 60s, 120s, then cap at 120s
+            val delay = (BACKGROUND_RECONNECT_INITIAL_DELAY_MS * (1 shl backgroundReconnectAttempt.coerceAtMost(2)))
+                .coerceAtMost(BACKGROUND_RECONNECT_MAX_DELAY_MS)
+
+            val runnable = Runnable {
+                attemptBackgroundReconnect()
+            }
+            backgroundReconnectRunnable = runnable
+
+            mainHandler.postDelayed(runnable, delay)
+            aapsLogger.info(LTag.PUMPBTCOMM,
+                "Background reconnect scheduled in ${delay / 1000}s (attempt ${backgroundReconnectAttempt + 1})")
+        }
+    }
+
+    private fun attemptBackgroundReconnect() {
+        if (manualDisconnect) {
+            stopBackgroundReconnect()
+            return
+        }
+
+        if (isConnected) {
+            aapsLogger.info(LTag.PUMPBTCOMM, "Already connected - stopping background reconnect")
+            stopBackgroundReconnect()
+            return
+        }
+
+        aapsLogger.info(LTag.PUMPBTCOMM, "Background reconnect attempt ${backgroundReconnectAttempt + 1}")
+        backgroundReconnectAttempt++
+
+        val useScanning = preferences.get(RileylinkBooleanPreferenceKey.OrangeUseScanning)
+        if (useScanning) {
+            // Scanning mode: trigger rescan
+            onReconnectNeeded?.invoke()
+        } else {
+            // MAC mode: attempt direct connection
+            if (rileyLinkDevice != null) {
+                connectGattInternal()
+            } else {
+                // Try to get device from stored address
+                rileyLinkServiceData.rileyLinkAddress?.let { address ->
+                    rileyLinkDevice = bluetoothAdapter?.getRemoteDevice(address)
+                    if (rileyLinkDevice != null) {
+                        connectGattInternal()
+                    }
+                }
+            }
+        }
+
+        // Schedule next attempt (will be cancelled if connection succeeds)
+        synchronized(backgroundReconnectLock) {
+            backgroundReconnectRunnable = null
+            scheduleBackgroundReconnect()
+        }
+    }
+
+    /**
+     * Stop background reconnect attempts.
+     * Called when connection is restored or manual disconnect is requested.
+     */
+    fun stopBackgroundReconnect() {
+        synchronized(backgroundReconnectLock) {
+            backgroundReconnectRunnable?.let {
+                mainHandler.removeCallbacks(it)
+                aapsLogger.debug(LTag.PUMPBTCOMM, "Background reconnect stopped")
+            }
+            backgroundReconnectRunnable = null
+            backgroundReconnectAttempt = 0
+        }
     }
 
     // ===== Connection Optimization =====
@@ -418,11 +535,13 @@ class RileyLinkBLE @Inject constructor(
             }, delay)
         } else {
             gatt133RetryCount.set(0)
-            aapsLogger.error(LTag.PUMPBTCOMM, "GATT 133 error: max retries exceeded")
+            aapsLogger.error(LTag.PUMPBTCOMM, "GATT 133 error: max retries exceeded, starting background reconnect")
             rileyLinkServiceData.setServiceState(
                 RileyLinkServiceState.RileyLinkError,
                 RileyLinkError.RileyLinkUnreachable
             )
+            // Start background reconnect to recover when device comes back in range
+            startBackgroundReconnect()
         }
     }
 
@@ -431,6 +550,7 @@ class RileyLinkBLE @Inject constructor(
         isConnected = false
         manualDisconnect = true
         cancelAutoConnectCheck()
+        stopBackgroundReconnect()
         aapsLogger.warn(LTag.PUMPBTCOMM, "Closing GATT connection (manual)")
         gattLock.withLock {
             bluetoothConnectionGatt?.disconnect()
@@ -450,6 +570,7 @@ class RileyLinkBLE @Inject constructor(
         aapsLogger.warn(LTag.PUMPBTCOMM, "Resetting BLE connection state")
         isConnected = false
         cancelAutoConnectCheck()
+        stopBackgroundReconnect()
         gattLock.withLock {
             mCurrentOperation = null
             gattOperationSema.drainPermits()
@@ -699,6 +820,7 @@ class RileyLinkBLE @Inject constructor(
                 when (newState) {
                     BluetoothProfile.STATE_CONNECTED -> {
                         cancelAutoConnectCheck()
+                        stopBackgroundReconnect()  // Stop background reconnect on successful connection
                         gatt133RetryCount.set(0)  // Reset on successful connection
 
                         if (status == BluetoothGatt.GATT_SUCCESS) {

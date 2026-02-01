@@ -273,11 +273,13 @@ class OrangeLinkImpl @Inject constructor(
             handler.sendEmptyMessageDelayed(MSG_RETRY, delay)
         } else {
             scanRetryCount = 0
-            aapsLogger.error(LTag.PUMPBTCOMM, "Scan failed after all retries")
+            aapsLogger.error(LTag.PUMPBTCOMM, "Scan failed after all retries, starting background reconnect")
             rileyLinkServiceData.setServiceState(
                 RileyLinkServiceState.BluetoothError,
                 RileyLinkError.RileyLinkUnreachable
             )
+            // Start background reconnect to recover when device comes back in range
+            rileyLinkBLE.startBackgroundReconnect()
         }
     }
 
