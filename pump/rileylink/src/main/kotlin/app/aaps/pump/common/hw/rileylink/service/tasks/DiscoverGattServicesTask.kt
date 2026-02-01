@@ -1,5 +1,6 @@
 package app.aaps.pump.common.hw.rileylink.service.tasks
 
+import android.os.SystemClock
 import app.aaps.core.interfaces.plugin.ActivePlugin
 import javax.inject.Inject
 
@@ -16,6 +17,11 @@ class DiscoverGattServicesTask @Inject constructor(
 
     override fun run() {
         if (needToConnect) pumpDevice?.rileyLinkService?.rileyLinkBLE?.connectGatt()
+
+        // Delay before service discovery - required on Android 12+ after MTU negotiation
+        // Without this delay, onServicesDiscovered() may never be called
+        SystemClock.sleep(1000)
+
         pumpDevice?.rileyLinkService?.rileyLinkBLE?.discoverServices()
     }
 }

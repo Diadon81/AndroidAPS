@@ -128,7 +128,8 @@ class RileyLinkBLE @Inject constructor(
         private const val BACKGROUND_RECONNECT_MAX_DELAY_MS = 30_000L
 
         // Service discovery timeout - if onServicesDiscovered not called within this time, retry
-        private const val SERVICE_DISCOVERY_TIMEOUT_MS = 15_000L
+        // Set to 30s for Android 12+ which can be slow with OrangeLink
+        private const val SERVICE_DISCOVERY_TIMEOUT_MS = 30_000L
 
         // OrangeLink connection parameters for reference:
         // MIN_CONN_INTERVAL: 50ms, MAX_CONN_INTERVAL: 100ms
