@@ -10,6 +10,7 @@ import app.aaps.core.interfaces.logging.LTag
 import app.aaps.core.interfaces.plugin.ActivePlugin
 import app.aaps.core.keys.interfaces.Preferences
 import app.aaps.pump.common.hw.rileylink.RileyLinkConst
+import app.aaps.pump.common.hw.rileylink.ble.device.OrangeLinkImpl
 import app.aaps.pump.common.hw.rileylink.defs.RileyLinkError
 import app.aaps.pump.common.hw.rileylink.defs.RileyLinkPumpDevice
 import app.aaps.pump.common.hw.rileylink.defs.RileyLinkServiceState
@@ -35,6 +36,7 @@ class RileyLinkBroadcastReceiver : DaggerBroadcastReceiver() {
     @Inject lateinit var rileyLinkServiceData: RileyLinkServiceData
     @Inject lateinit var serviceTaskExecutor: ServiceTaskExecutor
     @Inject lateinit var activePlugin: ActivePlugin
+    @Inject lateinit var orangeLink: OrangeLinkImpl
     @Inject lateinit var wakeAndTuneTaskProvider: Provider<WakeAndTuneTask>
     @Inject lateinit var initializePumpManagerTaskProvider: Provider<InitializePumpManagerTask>
     @Inject lateinit var discoverGattServicesTaskProvider: Provider<DiscoverGattServicesTask>
@@ -178,7 +180,7 @@ class RileyLinkBroadcastReceiver : DaggerBroadcastReceiver() {
             aapsLogger.info(LTag.PUMPBTCOMM, "Scanning mode: setting up reconnect callback")
             rileyLinkService?.rileyLinkBLE?.onReconnectNeeded = {
                 aapsLogger.info(LTag.PUMPBTCOMM, "Reconnect callback triggered - starting rescan")
-                rileyLinkService?.orangeLink?.startReconnectScan()
+                orangeLink.startReconnectScan()
             }
         } else {
             // For MAC mode, RileyLinkBLE handles reconnect internally

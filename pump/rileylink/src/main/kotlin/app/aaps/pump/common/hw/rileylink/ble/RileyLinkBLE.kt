@@ -740,57 +740,25 @@ class RileyLinkBLE @Inject constructor(
                 }
             }
 
-            // ===== Android 13+ (API 33) callback with value parameter =====
-
-            override fun onDescriptorWrite(
-                gatt: BluetoothGatt,
-                descriptor: BluetoothGattDescriptor,
-                status: Int,
-                value: ByteArray
-            ) {
-                handleDescriptorWrite(descriptor, status, value)
-            }
-
-            @Suppress("DEPRECATION", "OVERRIDE_DEPRECATION")
+            @Suppress("DEPRECATION")
             override fun onDescriptorWrite(gatt: BluetoothGatt, descriptor: BluetoothGattDescriptor, status: Int) {
                 super.onDescriptorWrite(gatt, descriptor, status)
-                // Legacy callback for Android < 13
-                handleDescriptorWrite(descriptor, status, descriptor.value ?: ByteArray(0))
-            }
-
-            private fun handleDescriptorWrite(descriptor: BluetoothGattDescriptor, status: Int, value: ByteArray) {
                 if (gattDebugEnabled) {
                     aapsLogger.warn(LTag.PUMPBTCOMM,
                         "onDescriptorWrite ${GattAttributes.lookup(descriptor.uuid)} " +
-                        "${getGattStatusMessage(status)} written: ${ByteUtil.getHex(value)}")
+                        "${getGattStatusMessage(status)} written: ${ByteUtil.getHex(descriptor.value)}")
                 }
-                mCurrentOperation?.gattOperationCompletionCallback(descriptor.uuid, value)
+                mCurrentOperation?.gattOperationCompletionCallback(descriptor.uuid, descriptor.value ?: ByteArray(0))
             }
 
-            // ===== Android 13+ (API 33) callback with value parameter =====
-
-            override fun onDescriptorRead(
-                gatt: BluetoothGatt,
-                descriptor: BluetoothGattDescriptor,
-                status: Int,
-                value: ByteArray
-            ) {
-                handleDescriptorRead(descriptor, status, value)
-            }
-
-            @Suppress("OVERRIDE_DEPRECATION", "DEPRECATION")
+            @Suppress("DEPRECATION")
             override fun onDescriptorRead(gatt: BluetoothGatt, descriptor: BluetoothGattDescriptor, status: Int) {
                 super.onDescriptorRead(gatt, descriptor, status)
-                // Legacy callback for Android < 13
-                handleDescriptorRead(descriptor, status, descriptor.value ?: ByteArray(0))
-            }
-
-            private fun handleDescriptorRead(descriptor: BluetoothGattDescriptor, status: Int, value: ByteArray) {
                 if (gattDebugEnabled) {
                     aapsLogger.warn(LTag.PUMPBTCOMM,
-                        "onDescriptorRead ${getGattStatusMessage(status)} ${GattAttributes.lookup(descriptor.uuid)}: ${ByteUtil.getHex(value)}")
+                        "onDescriptorRead ${getGattStatusMessage(status)} ${GattAttributes.lookup(descriptor.uuid)}: ${ByteUtil.getHex(descriptor.value)}")
                 }
-                mCurrentOperation?.gattOperationCompletionCallback(descriptor.uuid, value)
+                mCurrentOperation?.gattOperationCompletionCallback(descriptor.uuid, descriptor.value ?: ByteArray(0))
             }
 
             override fun onMtuChanged(gatt: BluetoothGatt, mtu: Int, status: Int) {
