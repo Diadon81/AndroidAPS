@@ -116,8 +116,8 @@ class RileyLinkBLE @Inject constructor(
     private val serviceDiscoveryLock = Any()
 
     companion object {
-        // OrangeLink supervision timeout is 5 seconds, so we need to react faster
-        private const val AUTO_CONNECT_TIMEOUT_MS = 10_000L  // Reduced from 30s to match OrangeLink better
+        // OrangeLink supervision timeout is 4 seconds, react faster
+        private const val AUTO_CONNECT_TIMEOUT_MS = 5_000L
         private const val MAX_GATT_133_RETRIES = 3
         private const val GATT_ERROR_133 = 133
         private const val PREFERRED_MTU = 185  // Default BLE MTU is 23, max is 517
@@ -128,8 +128,8 @@ class RileyLinkBLE @Inject constructor(
         private const val BACKGROUND_RECONNECT_MAX_DELAY_MS = 30_000L
 
         // Service discovery timeout - if onServicesDiscovered not called within this time, retry
-        // Set to 30s for Android 12+ which can be slow with OrangeLink
-        private const val SERVICE_DISCOVERY_TIMEOUT_MS = 30_000L
+        // Reduced to 8s for faster recovery with OrangeLink
+        private const val SERVICE_DISCOVERY_TIMEOUT_MS = 8_000L
 
         // OrangeLink connection parameters for reference:
         // MIN_CONN_INTERVAL: 50ms, MAX_CONN_INTERVAL: 100ms

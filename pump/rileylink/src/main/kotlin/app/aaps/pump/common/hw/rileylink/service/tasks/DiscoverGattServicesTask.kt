@@ -20,7 +20,7 @@ class DiscoverGattServicesTask @Inject constructor(
 
         // Delay before service discovery - required on Android 12+ after MTU negotiation
         // Without this delay, onServicesDiscovered() may never be called
-        SystemClock.sleep(1000)
+        SystemClock.sleep(500)
 
         pumpDevice?.rileyLinkService?.rileyLinkBLE?.discoverServices()
     }

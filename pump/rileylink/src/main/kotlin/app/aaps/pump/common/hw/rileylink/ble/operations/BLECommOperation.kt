@@ -20,5 +20,7 @@ abstract class BLECommOperation {
     open fun gattOperationCompletionCallback(uuid: UUID, value: ByteArray) {
     }
 
-    fun getGattOperationTimeout_ms(): Int = 22000
+    // Timeout must be less than OrangeLink CONN_SUP_TIMEOUT (4000ms)
+    // to avoid OrangeLink dropping connection while we're still waiting
+    fun getGattOperationTimeout_ms(): Int = 3500
 }
