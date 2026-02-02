@@ -116,8 +116,6 @@ class RileyLinkBLE @Inject constructor(
     private val serviceDiscoveryLock = Any()
 
     companion object {
-        // OrangeLink supervision timeout is 4 seconds, react faster
-        private const val AUTO_CONNECT_TIMEOUT_MS = 5_000L
         private const val MAX_GATT_133_RETRIES = 3
         private const val GATT_ERROR_133 = 133
         private const val PREFERRED_MTU = 185  // Default BLE MTU is 23, max is 517
@@ -127,14 +125,29 @@ class RileyLinkBLE @Inject constructor(
         private const val BACKGROUND_RECONNECT_INITIAL_DELAY_MS = 10_000L
         private const val BACKGROUND_RECONNECT_MAX_DELAY_MS = 30_000L
 
-        // Service discovery timeout - if onServicesDiscovered not called within this time, retry
-        // Reduced to 8s for faster recovery with OrangeLink
-        private const val SERVICE_DISCOVERY_TIMEOUT_MS = 8_000L
+        // === OrangeLink specific timeouts (nRF52, CONN_SUP_TIMEOUT=4000ms) ===
+        private const val ORANGELINK_AUTO_CONNECT_TIMEOUT_MS = 5_000L
+        private const val ORANGELINK_SERVICE_DISCOVERY_TIMEOUT_MS = 8_000L
 
-        // OrangeLink connection parameters for reference:
-        // MIN_CONN_INTERVAL: 50ms, MAX_CONN_INTERVAL: 100ms
-        // SLAVE_LATENCY: 0, CONN_SUP_TIMEOUT: 5000ms
+        // === RileyLink/EmaLink - no timeouts (BLE113 module, no explicit supervision timeout) ===
+        // These devices use Android's default supervision timeout (~20s)
+        // Setting to 0 means no timeout (like master branch)
+        private const val RILEYLINK_AUTO_CONNECT_TIMEOUT_MS = 0L
+        private const val RILEYLINK_SERVICE_DISCOVERY_TIMEOUT_MS = 0L
     }
+
+    // Helper to get device-specific timeouts
+    private fun getAutoConnectTimeoutMs(): Long =
+        if (rileyLinkServiceData.isOrange) ORANGELINK_AUTO_CONNECT_TIMEOUT_MS
+        else RILEYLINK_AUTO_CONNECT_TIMEOUT_MS
+
+    private fun getServiceDiscoveryTimeoutMs(): Long =
+        if (rileyLinkServiceData.isOrange) ORANGELINK_SERVICE_DISCOVERY_TIMEOUT_MS
+        else RILEYLINK_SERVICE_DISCOVERY_TIMEOUT_MS
+
+    private fun getGattOperationTimeoutMs(): Int =
+        if (rileyLinkServiceData.isOrange) BLECommOperation.ORANGELINK_GATT_OPERATION_TIMEOUT_MS
+        else BLECommOperation.DEFAULT_GATT_OPERATION_TIMEOUT_MS
 
     @Inject fun onInit() {
         orangeLink.rileyLinkBLE = this
@@ -198,13 +211,19 @@ class RileyLinkBLE @Inject constructor(
     }
 
     private fun scheduleServiceDiscoveryTimeout() {
+        val timeoutMs = getServiceDiscoveryTimeoutMs()
+        if (timeoutMs <= 0) {
+            aapsLogger.debug(LTag.PUMPBTCOMM, "Service discovery timeout disabled for RileyLink/EmaLink")
+            return
+        }
+
         synchronized(serviceDiscoveryLock) {
             cancelServiceDiscoveryTimeout()
 
             val runnable = Runnable {
                 if (!isConnected) {
                     aapsLogger.error(LTag.PUMPBTCOMM,
-                        "Service discovery timeout after ${SERVICE_DISCOVERY_TIMEOUT_MS}ms - retrying connection")
+                        "Service discovery timeout after ${timeoutMs}ms - retrying connection")
                     rileyLinkServiceData.setServiceState(
                         RileyLinkServiceState.BluetoothError,
                         RileyLinkError.RileyLinkUnreachable
@@ -215,8 +234,8 @@ class RileyLinkBLE @Inject constructor(
                 }
             }
             serviceDiscoveryTimeoutRunnable = runnable
-            mainHandler.postDelayed(runnable, SERVICE_DISCOVERY_TIMEOUT_MS)
-            aapsLogger.debug(LTag.PUMPBTCOMM, "Service discovery timeout scheduled in ${SERVICE_DISCOVERY_TIMEOUT_MS}ms")
+            mainHandler.postDelayed(runnable, timeoutMs)
+            aapsLogger.debug(LTag.PUMPBTCOMM, "Service discovery timeout scheduled in ${timeoutMs}ms")
         }
     }
 
@@ -379,8 +398,15 @@ class RileyLinkBLE @Inject constructor(
     /**
      * Schedule a check to verify autoConnect is working.
      * If connection is not restored within timeout, force reconnection.
+     * For RileyLink/EmaLink: timeout disabled (they use Android's default supervision timeout)
      */
     private fun scheduleAutoConnectCheck() {
+        val timeoutMs = getAutoConnectTimeoutMs()
+        if (timeoutMs <= 0) {
+            aapsLogger.debug(LTag.PUMPBTCOMM, "AutoConnect timeout disabled for RileyLink/EmaLink")
+            return
+        }
+
         synchronized(autoConnectLock) {
             cancelAutoConnectCheckInternal()
 
@@ -388,7 +414,7 @@ class RileyLinkBLE @Inject constructor(
 
             val runnable = Runnable {
                 if (!isConnected && !manualDisconnect) {
-                    aapsLogger.warn(LTag.PUMPBTCOMM, "AutoConnect timeout after ${AUTO_CONNECT_TIMEOUT_MS}ms")
+                    aapsLogger.warn(LTag.PUMPBTCOMM, "AutoConnect timeout after ${timeoutMs}ms")
 
                     if (useScanning) {
                         // Scanning mode: close GATT and trigger rescan
@@ -406,8 +432,8 @@ class RileyLinkBLE @Inject constructor(
             }
             autoConnectCheckRunnable = runnable
 
-            mainHandler.postDelayed(runnable, AUTO_CONNECT_TIMEOUT_MS)
-            aapsLogger.debug(LTag.PUMPBTCOMM, "Scheduled autoConnect check in ${AUTO_CONNECT_TIMEOUT_MS}ms")
+            mainHandler.postDelayed(runnable, timeoutMs)
+            aapsLogger.debug(LTag.PUMPBTCOMM, "Scheduled autoConnect check in ${timeoutMs}ms")
         }
     }
 
@@ -672,7 +698,7 @@ class RileyLinkBLE @Inject constructor(
                     aapsLogger.debug(LTag.PUMPBTCOMM, "Found descriptor: ${list[i]}")
                 }
             }
-            mCurrentOperation = DescriptorWriteOperation(aapsLogger, gatt, list[0], BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE)
+            mCurrentOperation = DescriptorWriteOperation(aapsLogger, gatt, list[0], BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE, getGattOperationTimeoutMs())
             mCurrentOperation?.execute(this)
             when {
                 mCurrentOperation?.timedOut == true    -> retValue.resultCode = BLECommOperationResult.RESULT_TIMEOUT
@@ -712,7 +738,7 @@ class RileyLinkBLE @Inject constructor(
                 retValue.resultCode = BLECommOperationResult.RESULT_NOT_CONFIGURED
                 return retValue
             }
-            mCurrentOperation = CharacteristicWriteOperation(aapsLogger, gatt, chara, value)
+            mCurrentOperation = CharacteristicWriteOperation(aapsLogger, gatt, chara, value, getGattOperationTimeoutMs())
             mCurrentOperation?.execute(this)
             when {
                 mCurrentOperation?.timedOut == true    -> retValue.resultCode = BLECommOperationResult.RESULT_TIMEOUT
@@ -752,7 +778,7 @@ class RileyLinkBLE @Inject constructor(
                 retValue.resultCode = BLECommOperationResult.RESULT_NOT_CONFIGURED
                 return retValue
             }
-            mCurrentOperation = CharacteristicReadOperation(aapsLogger, gatt, chara)
+            mCurrentOperation = CharacteristicReadOperation(aapsLogger, gatt, chara, getGattOperationTimeoutMs())
             mCurrentOperation?.execute(this)
             when {
                 mCurrentOperation?.timedOut == true    -> retValue.resultCode = BLECommOperationResult.RESULT_TIMEOUT

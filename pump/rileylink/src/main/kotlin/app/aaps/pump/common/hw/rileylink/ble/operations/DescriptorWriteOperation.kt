@@ -19,8 +19,9 @@ class DescriptorWriteOperation(
     private val aapsLogger: AAPSLogger,
     private val gatt: BluetoothGatt,
     private val descriptor: BluetoothGattDescriptor,
-    value: ByteArray
-) : BLECommOperation() {
+    value: ByteArray,
+    gattOperationTimeoutMs: Int = DEFAULT_GATT_OPERATION_TIMEOUT_MS
+) : BLECommOperation(gattOperationTimeoutMs) {
 
     init {
         this.value = value

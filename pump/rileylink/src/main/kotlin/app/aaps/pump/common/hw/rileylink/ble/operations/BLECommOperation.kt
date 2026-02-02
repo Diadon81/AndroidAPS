@@ -7,7 +7,17 @@ import java.util.concurrent.Semaphore
 /**
  * Created by geoff on 5/26/16.
  */
-abstract class BLECommOperation {
+abstract class BLECommOperation(
+    private val gattOperationTimeoutMs: Int = DEFAULT_GATT_OPERATION_TIMEOUT_MS
+) {
+
+    companion object {
+        // Default timeout for RileyLink/EmaLink (BLE113 module) - no explicit supervision timeout
+        const val DEFAULT_GATT_OPERATION_TIMEOUT_MS = 22_000
+
+        // OrangeLink timeout - must be less than CONN_SUP_TIMEOUT (4000ms)
+        const val ORANGELINK_GATT_OPERATION_TIMEOUT_MS = 3_500
+    }
 
     var timedOut: Boolean = false
     var interrupted: Boolean = false
@@ -20,7 +30,5 @@ abstract class BLECommOperation {
     open fun gattOperationCompletionCallback(uuid: UUID, value: ByteArray) {
     }
 
-    // Timeout must be less than OrangeLink CONN_SUP_TIMEOUT (4000ms)
-    // to avoid OrangeLink dropping connection while we're still waiting
-    fun getGattOperationTimeout_ms(): Int = 3500
+    fun getGattOperationTimeout_ms(): Int = gattOperationTimeoutMs
 }

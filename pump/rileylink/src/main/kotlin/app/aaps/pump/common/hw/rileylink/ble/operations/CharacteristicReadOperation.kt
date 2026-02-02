@@ -19,8 +19,9 @@ import java.util.concurrent.TimeUnit
 class CharacteristicReadOperation(
     private val aapsLogger: AAPSLogger,
     private val gatt: BluetoothGatt,
-    private val characteristic: BluetoothGattCharacteristic
-) : BLECommOperation() {
+    private val characteristic: BluetoothGattCharacteristic,
+    gattOperationTimeoutMs: Int = DEFAULT_GATT_OPERATION_TIMEOUT_MS
+) : BLECommOperation(gattOperationTimeoutMs) {
 
     @SuppressLint("MissingPermission")
     override fun execute(comm: RileyLinkBLE) {
