@@ -41,6 +41,7 @@ class RileyLinkServiceData @Inject constructor(
     var showBatteryLevel = false
     var lastTuneUpTime = 0L
     var lastGoodFrequency: Double? = null
+    var tuneUpFailureCount = 0
 
     // bt version
     var versionBLE113: String? = null

@@ -11,6 +11,7 @@ import app.aaps.core.interfaces.resources.ResourceHelper
 import app.aaps.core.interfaces.rx.bus.RxBus
 import app.aaps.core.keys.interfaces.Preferences
 import app.aaps.pump.common.hw.rileylink.RileyLinkCommunicationManager
+import app.aaps.pump.common.hw.rileylink.RileyLinkConst
 import app.aaps.pump.common.hw.rileylink.RileyLinkUtil
 import app.aaps.pump.common.hw.rileylink.ble.RFSpy
 import app.aaps.pump.common.hw.rileylink.ble.RileyLinkBLE
@@ -137,9 +138,15 @@ abstract class RileyLinkService : DaggerService() {
             rileyLinkServiceData.lastTuneUpTime = System.currentTimeMillis()
         }
         if (newFrequency == 0.0) {
-            // error tuning pump, pump not present ??
+            // error tuning pump, pump not present
+            rileyLinkServiceData.tuneUpFailureCount++
+            aapsLogger.warn(LTag.PUMPBTCOMM, "Pump tune-up failed (attempt ${rileyLinkServiceData.tuneUpFailureCount})")
             rileyLinkServiceData.setServiceState(RileyLinkServiceState.PumpConnectorError, RileyLinkError.TuneUpOfDeviceFailed)
+
+            // Always retry via broadcast
+            rileyLinkUtil.sendBroadcastMessage(RileyLinkConst.IPC.MSG_PUMP_tunePump)
         } else {
+            rileyLinkServiceData.tuneUpFailureCount = 0  // Reset on success
             deviceCommunicationManager.clearNotConnectedCount()
             rileyLinkServiceData.setServiceState(RileyLinkServiceState.PumpConnectorReady)
         }
