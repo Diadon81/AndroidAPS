@@ -12,6 +12,7 @@ import app.aaps.pump.common.hw.rileylink.defs.RileyLinkError
 import app.aaps.pump.common.hw.rileylink.defs.RileyLinkServiceState
 import app.aaps.pump.common.hw.rileylink.defs.RileyLinkTargetDevice
 import java.util.Locale
+import java.util.concurrent.atomic.AtomicBoolean
 import javax.inject.Inject
 import javax.inject.Singleton
 
@@ -42,6 +43,7 @@ class RileyLinkServiceData @Inject constructor(
     var lastTuneUpTime = 0L
     var lastGoodFrequency: Double? = null
     @Volatile var tuneUpFailureCount = 0
+    val tuneUpInProgress = AtomicBoolean(false)
 
     // bt version
     var versionBLE113: String? = null
