@@ -19,6 +19,8 @@ import app.aaps.pump.common.hw.rileylink.ble.defs.RileyLinkEncodingType
 import app.aaps.pump.common.hw.rileylink.defs.RileyLinkError
 import app.aaps.pump.common.hw.rileylink.defs.RileyLinkServiceState
 import app.aaps.pump.common.hw.rileylink.keys.RileyLinkDoubleKey
+import android.os.Handler
+import android.os.Looper
 import dagger.android.DaggerService
 import java.util.Locale
 import javax.inject.Inject
@@ -139,12 +141,16 @@ abstract class RileyLinkService : DaggerService() {
         }
         if (newFrequency == 0.0) {
             // error tuning pump, pump not present
-            rileyLinkServiceData.tuneUpFailureCount++
-            aapsLogger.warn(LTag.PUMPBTCOMM, "Pump tune-up failed (attempt ${rileyLinkServiceData.tuneUpFailureCount})")
+            val failureCount = ++rileyLinkServiceData.tuneUpFailureCount
+            aapsLogger.warn(LTag.PUMPBTCOMM, "Pump tune-up failed (attempt $failureCount)")
             rileyLinkServiceData.setServiceState(RileyLinkServiceState.PumpConnectorError, RileyLinkError.TuneUpOfDeviceFailed)
 
-            // Always retry via broadcast
-            rileyLinkUtil.sendBroadcastMessage(RileyLinkConst.IPC.MSG_PUMP_tunePump)
+            // Always retry with exponential backoff: 15s → 30s → 60s (capped)
+            val delay = (15_000L * (1 shl (failureCount - 1).coerceAtMost(2))).coerceAtMost(60_000L)
+            aapsLogger.info(LTag.PUMPBTCOMM, "Scheduling tune-up retry in ${delay / 1000}s")
+            Handler(Looper.getMainLooper()).postDelayed({
+                rileyLinkUtil.sendBroadcastMessage(RileyLinkConst.IPC.MSG_PUMP_tunePump)
+            }, delay)
         } else {
             rileyLinkServiceData.tuneUpFailureCount = 0  // Reset on success
             deviceCommunicationManager.clearNotConnectedCount()

@@ -40,8 +40,8 @@ class DescriptorWriteOperation(
                 return
             }
         } else {
-            // Legacy API returns boolean
-            if (writeResult != BluetoothGatt.GATT_SUCCESS && writeResult != 1) {
+            // Legacy API returns boolean (mapped to GATT_SUCCESS/GATT_FAILURE)
+            if (writeResult != BluetoothGatt.GATT_SUCCESS) {
                 aapsLogger.error(LTag.PUMPBTCOMM, "writeDescriptor failed to initiate")
                 timedOut = true
                 return

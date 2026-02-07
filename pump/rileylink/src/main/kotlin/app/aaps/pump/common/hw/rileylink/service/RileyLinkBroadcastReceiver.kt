@@ -67,7 +67,6 @@ class RileyLinkBroadcastReceiver : DaggerBroadcastReceiver() {
         broadcastIdentifiers["RileyLink"] = listOf(
             RileyLinkConst.Intents.RileyLinkDisconnected,
             RileyLinkConst.Intents.RileyLinkReady,
-            RileyLinkConst.Intents.RileyLinkDisconnected,
             RileyLinkConst.Intents.RileyLinkNewAddressSet,
             RileyLinkConst.Intents.RileyLinkDisconnect
         )
@@ -108,7 +107,7 @@ class RileyLinkBroadcastReceiver : DaggerBroadcastReceiver() {
 
                 val btManager = context.getSystemService(Context.BLUETOOTH_SERVICE) as BluetoothManager
 
-                if (btManager.adapter.isEnabled) {
+                if (btManager.adapter?.isEnabled == true) {
                     rileyLinkServiceData.setServiceState(
                         RileyLinkServiceState.BluetoothError,
                         RileyLinkError.RileyLinkUnreachable

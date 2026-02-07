@@ -14,6 +14,7 @@ import java.util.concurrent.Executors
 import java.util.concurrent.LinkedBlockingQueue
 import java.util.concurrent.Semaphore
 import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicInteger
 
 /**
@@ -28,8 +29,8 @@ class RFSpyReader internal constructor(private val aapsLogger: AAPSLogger, priva
     private val releaseCount = AtomicInteger(0)
     @Volatile
     private var stopAtNull = true
-    @Volatile
-    private var running = false
+    private val running = AtomicBoolean(false)
+    private val lifecycleLock = Any()
 
     fun setRileyLinkEncodingType(encodingType: RileyLinkEncodingType) {
         aapsLogger.debug("setRileyLinkEncodingType: $encodingType")
@@ -65,84 +66,87 @@ class RFSpyReader internal constructor(private val aapsLogger: AAPSLogger, priva
     }
 
     fun start() {
-        if (running) {
-            aapsLogger.debug(LTag.PUMPBTCOMM, "RFSpyReader already running")
-            return
-        }
-        // Reset all state to clean before starting
-        waitForRadioData.drainPermits()
-        acquireCount.set(0)
-        releaseCount.set(0)
-        mDataQueue.clear()  // Clear any stale data from previous sessions
-        running = true
-        // Create a new executor for this session
-        executor = Executors.newSingleThreadExecutor()
-        executor?.execute {
-            val serviceUUID = UUID.fromString(GattAttributes.SERVICE_RADIO)
-            val radioDataUUID = UUID.fromString(GattAttributes.CHARA_RADIO_DATA)
-            aapsLogger.debug(LTag.PUMPBTCOMM, "RFSpyReader started")
-            while (running) {
-                try {
-                    val count = acquireCount.incrementAndGet()
-                    waitForRadioData.acquire()
-                    if (!running) {
-                        aapsLogger.debug(LTag.PUMPBTCOMM, "RFSpyReader stopping after acquire")
-                        break
-                    }
-                    aapsLogger.debug(LTag.PUMPBTCOMM, "${ThreadUtil.sig()}waitForRadioData acquired (count=$count) at t=${SystemClock.uptimeMillis()}")
-                    SystemClock.sleep(1)
-                    val result = rileyLinkBle.readCharacteristicBlocking(serviceUUID, radioDataUUID)
-                    SystemClock.sleep(1)
-                    if (result.resultCode == BLECommOperationResult.RESULT_SUCCESS) {
-                        if (stopAtNull) {
-                            // only data up to the first null is valid
-                            result.value?.let { resultValue ->
-                                for (i in resultValue.indices) {
-                                    if (resultValue[i].toInt() == 0) {
-                                        result.value = ByteUtil.substring(resultValue, 0, i)
-                                        break
+        synchronized(lifecycleLock) {
+            if (!running.compareAndSet(false, true)) {
+                aapsLogger.debug(LTag.PUMPBTCOMM, "RFSpyReader already running")
+                return
+            }
+            // Reset all state to clean before starting
+            waitForRadioData.drainPermits()
+            acquireCount.set(0)
+            releaseCount.set(0)
+            mDataQueue.clear()  // Clear any stale data from previous sessions
+            // Create a new executor for this session
+            executor = Executors.newSingleThreadExecutor()
+            executor?.execute {
+                val serviceUUID = UUID.fromString(GattAttributes.SERVICE_RADIO)
+                val radioDataUUID = UUID.fromString(GattAttributes.CHARA_RADIO_DATA)
+                aapsLogger.debug(LTag.PUMPBTCOMM, "RFSpyReader started")
+                while (running.get()) {
+                    try {
+                        val count = acquireCount.incrementAndGet()
+                        waitForRadioData.acquire()
+                        if (!running.get()) {
+                            aapsLogger.debug(LTag.PUMPBTCOMM, "RFSpyReader stopping after acquire")
+                            break
+                        }
+                        aapsLogger.debug(LTag.PUMPBTCOMM, "${ThreadUtil.sig()}waitForRadioData acquired (count=$count) at t=${SystemClock.uptimeMillis()}")
+                        SystemClock.sleep(1)
+                        val result = rileyLinkBle.readCharacteristicBlocking(serviceUUID, radioDataUUID)
+                        SystemClock.sleep(1)
+                        if (result.resultCode == BLECommOperationResult.RESULT_SUCCESS) {
+                            if (stopAtNull) {
+                                // only data up to the first null is valid
+                                result.value?.let { resultValue ->
+                                    for (i in resultValue.indices) {
+                                        if (resultValue[i].toInt() == 0) {
+                                            result.value = ByteUtil.substring(resultValue, 0, i)
+                                            break
+                                        }
                                     }
                                 }
                             }
-                        }
-                        mDataQueue.add(result.value)
-                    } else if (result.resultCode == BLECommOperationResult.RESULT_INTERRUPTED)
-                        aapsLogger.error(LTag.PUMPBTCOMM, "Read operation was interrupted")
-                    else if (result.resultCode == BLECommOperationResult.RESULT_TIMEOUT)
-                        aapsLogger.error(LTag.PUMPBTCOMM, "Read operation on Radio Data timed out")
-                    else if (result.resultCode == BLECommOperationResult.RESULT_BUSY)
-                        aapsLogger.error(LTag.PUMPBTCOMM, "FAIL: RileyLinkBLE reports operation already in progress")
-                    else if (result.resultCode == BLECommOperationResult.RESULT_NONE)
-                        aapsLogger.error(LTag.PUMPBTCOMM, "FAIL: got invalid result code: ${result.resultCode}")
-                } catch (e: InterruptedException) {
-                    aapsLogger.error(LTag.PUMPBTCOMM, "Interrupted while waiting for data")
-                    Thread.currentThread().interrupt() // Restore interrupt status
-                    break // Exit loop on interrupt
+                            mDataQueue.add(result.value)
+                        } else if (result.resultCode == BLECommOperationResult.RESULT_INTERRUPTED)
+                            aapsLogger.error(LTag.PUMPBTCOMM, "Read operation was interrupted")
+                        else if (result.resultCode == BLECommOperationResult.RESULT_TIMEOUT)
+                            aapsLogger.error(LTag.PUMPBTCOMM, "Read operation on Radio Data timed out")
+                        else if (result.resultCode == BLECommOperationResult.RESULT_BUSY)
+                            aapsLogger.error(LTag.PUMPBTCOMM, "FAIL: RileyLinkBLE reports operation already in progress")
+                        else if (result.resultCode == BLECommOperationResult.RESULT_NONE)
+                            aapsLogger.error(LTag.PUMPBTCOMM, "FAIL: got invalid result code: ${result.resultCode}")
+                    } catch (e: InterruptedException) {
+                        aapsLogger.error(LTag.PUMPBTCOMM, "Interrupted while waiting for data")
+                        Thread.currentThread().interrupt() // Restore interrupt status
+                        break // Exit loop on interrupt
+                    }
                 }
+                aapsLogger.debug(LTag.PUMPBTCOMM, "RFSpyReader stopped")
             }
-            aapsLogger.debug(LTag.PUMPBTCOMM, "RFSpyReader stopped")
         }
     }
 
     fun stop() {
-        aapsLogger.debug(LTag.PUMPBTCOMM, "Stopping RFSpyReader")
-        running = false
-        waitForRadioData.release() // Unblock acquire() if waiting
-        mDataQueue.clear()
-        // Shutdown executor and wait for termination
-        executor?.let { exec ->
-            exec.shutdown()
-            try {
-                if (!exec.awaitTermination(5, TimeUnit.SECONDS)) {
-                    aapsLogger.warn(LTag.PUMPBTCOMM, "RFSpyReader executor did not terminate in time, forcing shutdown")
+        synchronized(lifecycleLock) {
+            aapsLogger.debug(LTag.PUMPBTCOMM, "Stopping RFSpyReader")
+            running.set(false)
+            waitForRadioData.release() // Unblock acquire() if waiting
+            mDataQueue.clear()
+            // Shutdown executor and wait for termination
+            executor?.let { exec ->
+                exec.shutdown()
+                try {
+                    if (!exec.awaitTermination(5, TimeUnit.SECONDS)) {
+                        aapsLogger.warn(LTag.PUMPBTCOMM, "RFSpyReader executor did not terminate in time, forcing shutdown")
+                        exec.shutdownNow()
+                    }
+                } catch (e: InterruptedException) {
+                    aapsLogger.error(LTag.PUMPBTCOMM, "Interrupted while waiting for executor shutdown")
                     exec.shutdownNow()
+                    Thread.currentThread().interrupt()
                 }
-            } catch (e: InterruptedException) {
-                aapsLogger.error(LTag.PUMPBTCOMM, "Interrupted while waiting for executor shutdown")
-                exec.shutdownNow()
-                Thread.currentThread().interrupt()
             }
+            executor = null
         }
-        executor = null
     }
 }

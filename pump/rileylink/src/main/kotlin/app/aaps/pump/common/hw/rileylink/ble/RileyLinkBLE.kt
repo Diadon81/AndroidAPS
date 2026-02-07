@@ -14,7 +14,7 @@ import android.content.Context
 import android.content.pm.PackageManager
 import android.os.Build
 import android.os.Handler
-import android.os.Looper
+import android.os.HandlerThread
 import android.os.SystemClock
 import androidx.core.content.ContextCompat
 import app.aaps.core.interfaces.configuration.Config
@@ -71,7 +71,7 @@ class RileyLinkBLE @Inject constructor(
         get() = (context.getSystemService(Context.BLUETOOTH_SERVICE) as BluetoothManager?)?.adapter
 
     private val bluetoothGattCallback: BluetoothGattCallback
-    var rileyLinkDevice: BluetoothDevice? = null
+    @Volatile var rileyLinkDevice: BluetoothDevice? = null
 
     // Lock for thread-safe access to bluetoothConnectionGatt and mCurrentOperation
     private val gattLock = ReentrantLock()
@@ -86,11 +86,12 @@ class RileyLinkBLE @Inject constructor(
 
     // ===== Android 12-16 Improvements =====
 
-    // Handler for main thread operations
-    private val mainHandler = Handler(Looper.getMainLooper())
+    // Dedicated HandlerThread for BLE GATT callbacks and scheduled operations
+    // Avoids running BLE callbacks on main thread which risks ANR
+    private val bleHandlerThread = HandlerThread("RileyLinkBLE").also { it.start() }
+    private val bleHandler = Handler(bleHandlerThread.looper)
 
     // AutoConnect fallback mechanism
-    private var lastDisconnectTime: Long = 0
     private val autoConnectLock = Any()
     @Volatile
     private var autoConnectCheckRunnable: Runnable? = null
@@ -99,7 +100,7 @@ class RileyLinkBLE @Inject constructor(
     private val gatt133RetryCount = AtomicInteger(0)
 
     // Callback for reconnect in scanning mode
-    var onReconnectNeeded: (() -> Unit)? = null
+    @Volatile var onReconnectNeeded: (() -> Unit)? = null
 
     // ===== Background Reconnect Mechanism =====
     // Periodically attempts to reconnect when in error state
@@ -107,7 +108,7 @@ class RileyLinkBLE @Inject constructor(
     @Volatile
     private var backgroundReconnectRunnable: Runnable? = null
     private val backgroundReconnectLock = Any()
-    private var backgroundReconnectAttempt = 0
+    private val backgroundReconnectAttempt = AtomicInteger(0)
 
     // ===== Service Discovery Timeout =====
     // On Android 12+ service discovery can hang without callback
@@ -121,12 +122,12 @@ class RileyLinkBLE @Inject constructor(
         private const val PREFERRED_MTU = 185  // Default BLE MTU is 23, max is 517
 
         // Background reconnect: when all retries exhausted but device might come back in range
-        // Uses exponential backoff: 10s, 20s, 30s (capped) - balanced for medical device responsiveness
+        // Uses exponential backoff: 10s → 20s → 30s (capped) - balanced for medical device responsiveness
         private const val BACKGROUND_RECONNECT_INITIAL_DELAY_MS = 10_000L
         private const val BACKGROUND_RECONNECT_MAX_DELAY_MS = 30_000L
 
         // === OrangeLink specific timeouts (nRF52, CONN_SUP_TIMEOUT=4000ms) ===
-        private const val ORANGELINK_AUTO_CONNECT_TIMEOUT_MS = 5_000L
+        private const val ORANGELINK_AUTO_CONNECT_TIMEOUT_MS = 15_000L
         private const val ORANGELINK_SERVICE_DISCOVERY_TIMEOUT_MS = 8_000L
 
         // === RileyLink/EmaLink - no timeouts (BLE113 module, no explicit supervision timeout) ===
@@ -234,7 +235,7 @@ class RileyLinkBLE @Inject constructor(
                 }
             }
             serviceDiscoveryTimeoutRunnable = runnable
-            mainHandler.postDelayed(runnable, timeoutMs)
+            bleHandler.postDelayed(runnable, timeoutMs)
             aapsLogger.debug(LTag.PUMPBTCOMM, "Service discovery timeout scheduled in ${timeoutMs}ms")
         }
     }
@@ -242,7 +243,7 @@ class RileyLinkBLE @Inject constructor(
     private fun cancelServiceDiscoveryTimeout() {
         synchronized(serviceDiscoveryLock) {
             serviceDiscoveryTimeoutRunnable?.let {
-                mainHandler.removeCallbacks(it)
+                bleHandler.removeCallbacks(it)
                 aapsLogger.debug(LTag.PUMPBTCOMM, "Service discovery timeout cancelled")
             }
             serviceDiscoveryTimeoutRunnable = null
@@ -309,6 +310,9 @@ class RileyLinkBLE @Inject constructor(
         manualDisconnect = false
         cancelAutoConnectCheck()
 
+        // Close any existing GATT before creating new one to prevent resource leak
+        close()
+
         val gatt = createGattConnection()
 
         gattLock.withLock {
@@ -333,35 +337,16 @@ class RileyLinkBLE @Inject constructor(
      */
     @SuppressLint("MissingPermission")
     private fun createGattConnection(): BluetoothGatt? {
-        return when {
-            // Android 8+ (API 26): TRANSPORT_LE + PHY + Handler
-            Build.VERSION.SDK_INT >= Build.VERSION_CODES.O -> {
-                aapsLogger.debug(LTag.PUMPBTCOMM, "Using Android 8+ connectGatt with TRANSPORT_LE and Handler")
-                rileyLinkDevice?.connectGatt(
-                    context,
-                    true,  // autoConnect
-                    bluetoothGattCallback,
-                    BluetoothDevice.TRANSPORT_LE,
-                    BluetoothDevice.PHY_LE_1M_MASK,
-                    mainHandler
-                )
-            }
-            // Android 6+ (API 23): TRANSPORT_LE
-            Build.VERSION.SDK_INT >= Build.VERSION_CODES.M -> {
-                aapsLogger.debug(LTag.PUMPBTCOMM, "Using Android 6+ connectGatt with TRANSPORT_LE")
-                rileyLinkDevice?.connectGatt(
-                    context,
-                    true,
-                    bluetoothGattCallback,
-                    BluetoothDevice.TRANSPORT_LE
-                )
-            }
-            // Legacy
-            else -> {
-                aapsLogger.debug(LTag.PUMPBTCOMM, "Using legacy connectGatt")
-                rileyLinkDevice?.connectGatt(context, true, bluetoothGattCallback)
-            }
-        }
+        // minSdk=31 (Android 12+), so TRANSPORT_LE + PHY + Handler always available
+        aapsLogger.debug(LTag.PUMPBTCOMM, "connectGatt with TRANSPORT_LE and BLE Handler thread")
+        return rileyLinkDevice?.connectGatt(
+            context,
+            true,  // autoConnect
+            bluetoothGattCallback,
+            BluetoothDevice.TRANSPORT_LE,
+            BluetoothDevice.PHY_LE_1M_MASK,
+            bleHandler
+        )
     }
 
     /**
@@ -432,7 +417,7 @@ class RileyLinkBLE @Inject constructor(
             }
             autoConnectCheckRunnable = runnable
 
-            mainHandler.postDelayed(runnable, timeoutMs)
+            bleHandler.postDelayed(runnable, timeoutMs)
             aapsLogger.debug(LTag.PUMPBTCOMM, "Scheduled autoConnect check in ${timeoutMs}ms")
         }
     }
@@ -445,7 +430,7 @@ class RileyLinkBLE @Inject constructor(
 
     private fun cancelAutoConnectCheckInternal() {
         autoConnectCheckRunnable?.let {
-            mainHandler.removeCallbacks(it)
+            bleHandler.removeCallbacks(it)
             aapsLogger.debug(LTag.PUMPBTCOMM, "Cancelled autoConnect check")
         }
         autoConnectCheckRunnable = null
@@ -453,7 +438,7 @@ class RileyLinkBLE @Inject constructor(
 
     private fun forceReconnect() {
         close()
-        mainHandler.postDelayed({
+        bleHandler.postDelayed({
             if (!manualDisconnect && rileyLinkDevice != null) {
                 aapsLogger.info(LTag.PUMPBTCOMM, "Attempting forced reconnection")
                 connectGattInternal()
@@ -480,7 +465,7 @@ class RileyLinkBLE @Inject constructor(
                 return
             }
 
-            backgroundReconnectAttempt = 0
+            backgroundReconnectAttempt.set(0)
             scheduleBackgroundReconnect()
         }
     }
@@ -492,8 +477,9 @@ class RileyLinkBLE @Inject constructor(
                 return
             }
 
-            // Exponential backoff: 30s, 60s, 120s, then cap at 120s
-            val delay = (BACKGROUND_RECONNECT_INITIAL_DELAY_MS * (1 shl backgroundReconnectAttempt.coerceAtMost(2)))
+            // Exponential backoff: 10s → 20s → 30s (capped)
+            val attempt = backgroundReconnectAttempt.get()
+            val delay = (BACKGROUND_RECONNECT_INITIAL_DELAY_MS * (1 shl attempt.coerceAtMost(2)))
                 .coerceAtMost(BACKGROUND_RECONNECT_MAX_DELAY_MS)
 
             val runnable = Runnable {
@@ -501,9 +487,9 @@ class RileyLinkBLE @Inject constructor(
             }
             backgroundReconnectRunnable = runnable
 
-            mainHandler.postDelayed(runnable, delay)
+            bleHandler.postDelayed(runnable, delay)
             aapsLogger.info(LTag.PUMPBTCOMM,
-                "Background reconnect scheduled in ${delay / 1000}s (attempt ${backgroundReconnectAttempt + 1})")
+                "Background reconnect scheduled in ${delay / 1000}s (attempt ${attempt + 1})")
         }
     }
 
@@ -519,8 +505,8 @@ class RileyLinkBLE @Inject constructor(
             return
         }
 
-        aapsLogger.info(LTag.PUMPBTCOMM, "Background reconnect attempt ${backgroundReconnectAttempt + 1}")
-        backgroundReconnectAttempt++
+        val attempt = backgroundReconnectAttempt.incrementAndGet()
+        aapsLogger.info(LTag.PUMPBTCOMM, "Background reconnect attempt $attempt")
 
         val useScanning = preferences.get(RileylinkBooleanPreferenceKey.OrangeUseScanning)
         if (useScanning) {
@@ -555,11 +541,11 @@ class RileyLinkBLE @Inject constructor(
     fun stopBackgroundReconnect() {
         synchronized(backgroundReconnectLock) {
             backgroundReconnectRunnable?.let {
-                mainHandler.removeCallbacks(it)
+                bleHandler.removeCallbacks(it)
                 aapsLogger.debug(LTag.PUMPBTCOMM, "Background reconnect stopped")
             }
             backgroundReconnectRunnable = null
-            backgroundReconnectAttempt = 0
+            backgroundReconnectAttempt.set(0)
         }
     }
 
@@ -603,7 +589,7 @@ class RileyLinkBLE @Inject constructor(
             val delay = (1000L * (1 shl (retryCount - 1))).coerceAtMost(5000L)
             aapsLogger.info(LTag.PUMPBTCOMM, "Retrying connection in ${delay}ms")
 
-            mainHandler.postDelayed({
+            bleHandler.postDelayed({
                 if (!manualDisconnect) {
                     val useScanning = preferences.get(RileylinkBooleanPreferenceKey.OrangeUseScanning)
                     if (useScanning) {
@@ -629,6 +615,7 @@ class RileyLinkBLE @Inject constructor(
     fun disconnect() {
         isConnected = false
         manualDisconnect = true
+        gatt133RetryCount.set(0)
         cancelAutoConnectCheck()
         cancelServiceDiscoveryTimeout()
         stopBackgroundReconnect()
@@ -643,6 +630,11 @@ class RileyLinkBLE @Inject constructor(
         cancelAutoConnectCheck()
         cancelServiceDiscoveryTimeout()
         gattLock.withLock {
+            // Cancel any in-flight BLE operation to unblock waiting threads
+            mCurrentOperation?.let {
+                it.timedOut = true
+                it.operationComplete.release()
+            }
             bluetoothConnectionGatt?.close()
             bluetoothConnectionGatt = null
         }
@@ -874,15 +866,14 @@ class RileyLinkBLE @Inject constructor(
                 mCurrentOperation?.gattOperationCompletionCallback(characteristic.uuid, value)
             }
 
-            @Suppress("DEPRECATION")
             override fun onCharacteristicWrite(gatt: BluetoothGatt, characteristic: BluetoothGattCharacteristic, status: Int) {
                 super.onCharacteristicWrite(gatt, characteristic, status)
                 if (gattDebugEnabled) {
                     aapsLogger.debug(LTag.PUMPBTCOMM,
                         "${ThreadUtil.sig()}onCharacteristicWrite ${getGattStatusMessage(status)} " +
-                        "${GattAttributes.lookup(characteristic.uuid)} ${ByteUtil.shortHexString(characteristic.value)}")
+                        GattAttributes.lookup(characteristic.uuid))
                 }
-                mCurrentOperation?.gattOperationCompletionCallback(characteristic.uuid, characteristic.value ?: ByteArray(0))
+                mCurrentOperation?.gattOperationCompletionCallback(characteristic.uuid, ByteArray(0))
             }
 
             override fun onConnectionStateChange(gatt: BluetoothGatt, status: Int, newState: Int) {
@@ -906,9 +897,6 @@ class RileyLinkBLE @Inject constructor(
                         gatt133RetryCount.set(0)  // Reset on successful connection
 
                         if (status == BluetoothGatt.GATT_SUCCESS) {
-                            // Request connection optimizations before service discovery
-                            requestHighPriority()
-                            requestMtu()
                             rileyLinkUtil.sendBroadcastMessage(RileyLinkConst.Intents.BluetoothConnected)
                         } else {
                             aapsLogger.debug(LTag.PUMPBTCOMM,
@@ -919,7 +907,6 @@ class RileyLinkBLE @Inject constructor(
                     BluetoothProfile.STATE_DISCONNECTED -> {
                         rileyLinkUtil.sendBroadcastMessage(RileyLinkConst.Intents.RileyLinkDisconnected)
                         isConnected = false
-                        lastDisconnectTime = SystemClock.elapsedRealtime()
 
                         // Reset semaphore atomically
                         gattLock.withLock {
@@ -1018,6 +1005,9 @@ class RileyLinkBLE @Inject constructor(
                     aapsLogger.info(LTag.PUMPBTCOMM, "Gatt device is RileyLink device: $rileyLinkFound")
                     if (rileyLinkFound) {
                         isConnected = true
+                        // Request connection optimizations after services confirmed
+                        requestHighPriority()
+                        requestMtu()
                         rileyLinkUtil.sendBroadcastMessage(RileyLinkConst.Intents.RileyLinkReady)
                     } else {
                         isConnected = false

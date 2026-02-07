@@ -41,9 +41,8 @@ class CharacteristicWriteOperation(
                 return
             }
         } else {
-            // Legacy API returns boolean
-            @Suppress("DEPRECATION")
-            if (!writeResult.let { it == BluetoothGatt.GATT_SUCCESS || it == 1 }) {
+            // Legacy API returns boolean (mapped to GATT_SUCCESS/GATT_FAILURE)
+            if (writeResult != BluetoothGatt.GATT_SUCCESS) {
                 aapsLogger.error(LTag.PUMPBTCOMM, "writeCharacteristic failed to initiate")
                 timedOut = true
                 return
