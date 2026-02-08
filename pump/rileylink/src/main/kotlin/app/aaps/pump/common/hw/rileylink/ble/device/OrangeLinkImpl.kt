@@ -1,43 +1,75 @@
 package app.aaps.pump.common.hw.rileylink.ble.device
 
+import android.annotation.SuppressLint
 import android.bluetooth.BluetoothAdapter
+import android.content.Context
 import android.bluetooth.BluetoothGattCharacteristic
 import android.bluetooth.le.ScanCallback
 import android.bluetooth.le.ScanFilter
 import android.bluetooth.le.ScanResult
 import android.bluetooth.le.ScanSettings
+import android.content.pm.PackageManager
+import android.os.Build
 import android.os.Handler
 import android.os.HandlerThread
 import android.os.Message
+import androidx.core.content.ContextCompat
 import app.aaps.core.interfaces.logging.AAPSLogger
 import app.aaps.core.interfaces.logging.LTag
 import app.aaps.core.utils.pump.ByteUtil
 import app.aaps.pump.common.hw.rileylink.ble.RileyLinkBLE
 import app.aaps.pump.common.hw.rileylink.ble.data.GattAttributes
 import app.aaps.pump.common.hw.rileylink.ble.operations.BLECommOperationResult
+import app.aaps.pump.common.hw.rileylink.defs.RileyLinkError
+import app.aaps.pump.common.hw.rileylink.defs.RileyLinkServiceState
 import app.aaps.pump.common.hw.rileylink.service.RileyLinkServiceData
 import java.util.UUID
+import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicInteger
 import javax.inject.Inject
 import javax.inject.Singleton
 
+/**
+ * OrangeLink BLE scanning and notification handling.
+ * Updated: Android 12-16 compatibility improvements for BLE scanning
+ */
 @Singleton
 class OrangeLinkImpl @Inject constructor(
+    private val context: Context,
     var aapsLogger: AAPSLogger,
     var rileyLinkServiceData: RileyLinkServiceData
 ) {
 
     lateinit var rileyLinkBLE: RileyLinkBLE
 
+    // Scan state management
+    private val scanRetryCount = AtomicInteger(0)
+    private val isScanning = AtomicBoolean(false)
+
+    companion object {
+        const val SCAN_TIMEOUT_MS = 60_000  // 60 seconds
+        const val MAX_SCAN_RETRIES = 3
+        private const val MSG_TIMEOUT = 0x12
+        private const val MSG_RETRY = 0x13
+    }
+
     fun onCharacteristicChanged(characteristic: BluetoothGattCharacteristic, data: ByteArray) {
         if (characteristic.uuid.toString() == GattAttributes.CHARA_NOTIFICATION_ORANGE) {
+            // Validate data array has enough bytes before accessing indices
+            if (data.size < 7) {
+                aapsLogger.error(LTag.PUMPBTCOMM,
+                    "OrangeLinkImpl: onCharacteristicChanged received incomplete data, size=${data.size}, expected at least 7 bytes")
+                return
+            }
             val first = 0xff and data[0].toInt()
-            aapsLogger.info(LTag.PUMPBTCOMM, "OrangeLinkImpl: onCharacteristicChanged ${ByteUtil.shortHexString(data)}=====$first")
+            aapsLogger.info(LTag.PUMPBTCOMM,
+                "OrangeLinkImpl: onCharacteristicChanged ${ByteUtil.shortHexString(data)}=====$first")
             val fv = data[3].toString() + "." + data[4]
             val hv = data[5].toString() + "." + data[6]
             rileyLinkServiceData.versionOrangeFirmware = fv
             rileyLinkServiceData.versionOrangeHardware = hv
 
-            aapsLogger.info(LTag.PUMPBTCOMM, "OrangeLink: Firmware: ${fv}, Hardware: $hv")
+            aapsLogger.info(LTag.PUMPBTCOMM, "OrangeLink: Firmware: $fv, Hardware: $hv")
         }
     }
 
@@ -48,7 +80,7 @@ class OrangeLinkImpl @Inject constructor(
     }
 
     /**
-     * We are checking if this is special Orange (with ORANGE_NOTIFICATION_SERVICE)
+     * Check if this is an OrangeLink device (has ORANGE_NOTIFICATION_SERVICE)
      */
     fun checkIsOrange(uuidService: UUID) {
         if (GattAttributes.isOrange(uuidService))
@@ -58,57 +90,159 @@ class OrangeLinkImpl @Inject constructor(
     fun enableNotifications(): Boolean {
         aapsLogger.info(LTag.PUMPBTCOMM, "OrangeLinkImpl::enableNotifications")
         val result: BLECommOperationResult = rileyLinkBLE.setNotificationBlocking(
-            UUID.fromString(GattAttributes.SERVICE_RADIO_ORANGE),  //
+            UUID.fromString(GattAttributes.SERVICE_RADIO_ORANGE),
             UUID.fromString(GattAttributes.CHARA_NOTIFICATION_ORANGE)
         )
 
         if (result.resultCode != BLECommOperationResult.RESULT_SUCCESS) {
-            aapsLogger.error(LTag.PUMPBTCOMM, "Error setting response count notification")
+            aapsLogger.error(LTag.PUMPBTCOMM, "Error setting OrangeLink notification")
             return false
         }
         return true
     }
 
     private fun buildScanFilters(): List<ScanFilter> {
-        val scanFilterList: MutableList<ScanFilter> = mutableListOf() //ArrayList<*> = ArrayList<Any>()
-        val scanFilterBuilder = ScanFilter.Builder()
-        scanFilterBuilder.setDeviceAddress(rileyLinkServiceData.rileyLinkAddress)
-        scanFilterList.add(scanFilterBuilder.build())
-        return scanFilterList
+        val address = rileyLinkServiceData.rileyLinkAddress
+        if (address.isNullOrEmpty()) {
+            aapsLogger.warn(LTag.PUMPBTCOMM, "No RileyLink address configured for scan filter")
+            return emptyList()
+        }
+
+        return listOf(
+            ScanFilter.Builder()
+                .setDeviceAddress(address)
+                .build()
+        )
     }
 
-    private fun buildScanSettings(): ScanSettings? {
-        val scanSettingBuilder = ScanSettings.Builder()
-        scanSettingBuilder.setScanMode(ScanSettings.SCAN_MODE_LOW_LATENCY)
-        scanSettingBuilder.setMatchMode(ScanSettings.MATCH_MODE_AGGRESSIVE)
-        scanSettingBuilder.setCallbackType(ScanSettings.CALLBACK_TYPE_ALL_MATCHES)
-        return scanSettingBuilder.build()
+    /**
+     * Build scan settings with Android version-specific optimizations.
+     *
+     * Android 12+: SCAN_MODE_LOW_LATENCY can be throttled, use BALANCED instead
+     * Android 8+: Support for legacy mode and PHY settings
+     */
+    @SuppressLint("MissingPermission")
+    private fun buildScanSettings(): ScanSettings {
+        val builder = ScanSettings.Builder()
+
+        // Scan mode: Android 12+ throttles LOW_LATENCY in background
+        when {
+            Build.VERSION.SDK_INT >= Build.VERSION_CODES.S -> {
+                builder.setScanMode(ScanSettings.SCAN_MODE_BALANCED)
+                aapsLogger.debug(LTag.PUMPBTCOMM, "Using SCAN_MODE_BALANCED for Android 12+")
+            }
+            else -> {
+                builder.setScanMode(ScanSettings.SCAN_MODE_LOW_LATENCY)
+            }
+        }
+
+        builder.setMatchMode(ScanSettings.MATCH_MODE_AGGRESSIVE)
+        builder.setCallbackType(ScanSettings.CALLBACK_TYPE_ALL_MATCHES)
+        builder.setNumOfMatches(ScanSettings.MATCH_NUM_ONE_ADVERTISEMENT)
+
+        // Android 8+: legacy advertising mode (implies 1M PHY)
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            builder.setLegacy(true)  // OrangeLink uses legacy advertising
+        }
+
+        return builder.build()
     }
 
+    /**
+     * Start BLE scan for OrangeLink device.
+     */
+    @SuppressLint("MissingPermission")
     fun startScan() {
+        if (!isScanning.compareAndSet(false, true)) {
+            aapsLogger.debug(LTag.PUMPBTCOMM, "Scan already in progress, skipping")
+            return
+        }
+
+        // Verify we have an address to scan for
+        val address = rileyLinkServiceData.rileyLinkAddress
+        if (address.isNullOrEmpty()) {
+            aapsLogger.error(LTag.PUMPBTCOMM, "Cannot start scan - no RileyLink address configured")
+            isScanning.set(false)
+            rileyLinkServiceData.setServiceState(
+                RileyLinkServiceState.BluetoothError,
+                RileyLinkError.RileyLinkUnreachable
+            )
+            return
+        }
+
+        // Check BLUETOOTH_SCAN permission (required on Android 12+)
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+            if (ContextCompat.checkSelfPermission(
+                    context,
+                    "android.permission.BLUETOOTH_SCAN"
+                ) != PackageManager.PERMISSION_GRANTED
+            ) {
+                aapsLogger.error(LTag.PUMPBTCOMM, "BLUETOOTH_SCAN permission not granted")
+                isScanning.set(false)
+                return
+            }
+        }
+
         try {
-            stopScan()
-            aapsLogger.debug(LTag.PUMPBTCOMM, "startScan")
-            handler.sendEmptyMessageDelayed(TIME_OUT_WHAT, TIME_OUT.toLong())
-            val bluetoothLeScanner = rileyLinkBLE.bluetoothAdapter?.bluetoothLeScanner
-            // if (bluetoothLeScanner == null) {
-            //     bluetoothAdapter.startLeScan(mLeScanCallback)
-            //     return
-            // }
-            bluetoothLeScanner?.startScan(buildScanFilters(), buildScanSettings(), scanCallback)
+            stopScanInternal()
+            isScanning.set(true)  // Re-set after stopScanInternal clears it
+
+            aapsLogger.debug(LTag.PUMPBTCOMM,
+                "Starting BLE scan (attempt ${scanRetryCount.get() + 1}/${MAX_SCAN_RETRIES + 1})")
+
+            handler.sendEmptyMessageDelayed(MSG_TIMEOUT, SCAN_TIMEOUT_MS.toLong())
+
+            val scanner = rileyLinkBLE.bluetoothAdapter?.bluetoothLeScanner
+            if (scanner == null) {
+                aapsLogger.error(LTag.PUMPBTCOMM, "BluetoothLeScanner is null - Bluetooth may be off")
+                handleScanError(ScanCallback.SCAN_FAILED_INTERNAL_ERROR)
+                return
+            }
+
+            val filters = buildScanFilters()
+            val settings = buildScanSettings()
+
+            scanner.startScan(filters, settings, scanCallback)
+            aapsLogger.info(LTag.PUMPBTCOMM,
+                "BLE scan started for address: $address")
+
         } catch (e: Exception) {
-            e.printStackTrace()
-            aapsLogger.error(LTag.PUMPBTCOMM, "Start scan: ${e.message}", e)
+            aapsLogger.error(LTag.PUMPBTCOMM, "startScan exception: ${e.message}", e)
+            handleScanError(ScanCallback.SCAN_FAILED_INTERNAL_ERROR)
         }
     }
 
+    /**
+     * Start scan specifically for reconnection after disconnect.
+     * Resets retry counter for fresh reconnection attempt.
+     */
+    fun startReconnectScan() {
+        aapsLogger.info(LTag.PUMPBTCOMM, "Starting reconnect scan for OrangeLink")
+        scanRetryCount.set(0)
+        startScan()
+    }
+
     private val scanCallback: ScanCallback = object : ScanCallback() {
+
+        @SuppressLint("MissingPermission")
         override fun onScanResult(callbackType: Int, result: ScanResult) {
             super.onScanResult(callbackType, result)
-            //val name = result.device.name
+
             val address = result.device.address
-            if (rileyLinkServiceData.rileyLinkAddress.equals(address)) {
-                stopScan()
+            val targetAddress = rileyLinkServiceData.rileyLinkAddress
+
+            aapsLogger.debug(LTag.PUMPBTCOMM, "Scan result: $address (looking for $targetAddress)")
+
+            if (address.equals(targetAddress, ignoreCase = true)) {
+                // Use compareAndSet to ensure only one match triggers connection
+                if (!isScanning.compareAndSet(true, false)) {
+                    aapsLogger.debug(LTag.PUMPBTCOMM, "Match already handled, skipping duplicate")
+                    return
+                }
+                aapsLogger.info(LTag.PUMPBTCOMM, "Found OrangeLink device: $address, RSSI: ${result.rssi}")
+                scanRetryCount.set(0)  // Reset on success
+                stopScanInternal()
+
                 rileyLinkBLE.rileyLinkDevice = result.device
                 rileyLinkBLE.connectGattInternal()
             }
@@ -116,41 +250,139 @@ class OrangeLinkImpl @Inject constructor(
 
         override fun onBatchScanResults(results: List<ScanResult>) {
             super.onBatchScanResults(results)
+            if (!isScanning.get()) return
+            aapsLogger.debug(LTag.PUMPBTCOMM, "Batch scan results: ${results.size} devices")
+            results.forEach { result ->
+                onScanResult(ScanSettings.CALLBACK_TYPE_ALL_MATCHES, result)
+            }
         }
 
         override fun onScanFailed(errorCode: Int) {
             super.onScanFailed(errorCode)
-            stopScan()
+            aapsLogger.error(LTag.PUMPBTCOMM, "Scan failed: ${getScanErrorString(errorCode)}")
+            handleScanError(errorCode)
         }
     }
 
-    private val handler: Handler = object : Handler(HandlerThread(this::class.java.simpleName + "Handler").also { it.start() }.looper) {
+    /**
+     * Handle scan errors with retry logic.
+     * Some errors should not be retried (e.g., app registration failed).
+     */
+    @SuppressLint("MissingPermission")
+    private fun handleScanError(errorCode: Int) {
+        stopScanInternal()
+
+        // Determine if retry is appropriate
+        val shouldRetry = when (errorCode) {
+            ScanCallback.SCAN_FAILED_APPLICATION_REGISTRATION_FAILED -> {
+                aapsLogger.error(LTag.PUMPBTCOMM, "App registration failed - cannot retry")
+                false
+            }
+            ScanCallback.SCAN_FAILED_FEATURE_UNSUPPORTED -> {
+                aapsLogger.error(LTag.PUMPBTCOMM, "BLE scanning not supported")
+                false
+            }
+            ScanCallback.SCAN_FAILED_ALREADY_STARTED -> {
+                // Stop the existing scan before retrying
+                aapsLogger.warn(LTag.PUMPBTCOMM, "Scan already started - stopping before retry")
+                try {
+                    rileyLinkBLE.bluetoothAdapter?.bluetoothLeScanner?.stopScan(scanCallback)
+                } catch (e: Exception) {
+                    aapsLogger.debug(LTag.PUMPBTCOMM, "stopScan in ALREADY_STARTED recovery: ${e.message}")
+                }
+                true
+            }
+            else -> true
+        }
+
+        val currentRetry = scanRetryCount.get()
+        if (shouldRetry && currentRetry < MAX_SCAN_RETRIES) {
+            val newRetry = scanRetryCount.incrementAndGet()
+            val delay = 2000L * newRetry  // 2s, 4s, 6s
+            aapsLogger.info(LTag.PUMPBTCOMM,
+                "Scheduling scan retry $newRetry/$MAX_SCAN_RETRIES in ${delay}ms")
+            handler.sendEmptyMessageDelayed(MSG_RETRY, delay)
+        } else {
+            scanRetryCount.set(0)
+            aapsLogger.error(LTag.PUMPBTCOMM, "Scan failed after all retries, starting background reconnect")
+            rileyLinkServiceData.setServiceState(
+                RileyLinkServiceState.BluetoothError,
+                RileyLinkError.RileyLinkUnreachable
+            )
+            // Start background reconnect to recover when device comes back in range
+            rileyLinkBLE.startBackgroundReconnect()
+        }
+    }
+
+    private fun getScanErrorString(errorCode: Int): String = when (errorCode) {
+        ScanCallback.SCAN_FAILED_ALREADY_STARTED -> "ALREADY_STARTED"
+        ScanCallback.SCAN_FAILED_APPLICATION_REGISTRATION_FAILED -> "APP_REGISTRATION_FAILED"
+        ScanCallback.SCAN_FAILED_INTERNAL_ERROR -> "INTERNAL_ERROR"
+        ScanCallback.SCAN_FAILED_FEATURE_UNSUPPORTED -> "FEATURE_UNSUPPORTED"
+        5 -> "OUT_OF_HARDWARE_RESOURCES"  // Android 13+
+        6 -> "SCANNING_TOO_FREQUENTLY"    // Android 13+
+        else -> "UNKNOWN ($errorCode)"
+    }
+
+    // Store reference to HandlerThread for proper cleanup
+    private val handlerThread: HandlerThread = HandlerThread(
+        this::class.java.simpleName + "Handler"
+    ).also { it.start() }
+
+    private val handler: Handler = object : Handler(handlerThread.looper) {
         override fun handleMessage(msg: Message) {
-            super.handleMessage(msg)
             when (msg.what) {
-                TIME_OUT_WHAT -> stopScan()
+                MSG_TIMEOUT -> {
+                    aapsLogger.warn(LTag.PUMPBTCOMM, "Scan timeout after ${SCAN_TIMEOUT_MS}ms")
+                    handleScanError(ScanCallback.SCAN_FAILED_INTERNAL_ERROR)
+                }
+                MSG_RETRY -> {
+                    aapsLogger.debug(LTag.PUMPBTCOMM, "Executing scan retry")
+                    startScan()
+                }
             }
         }
     }
 
+    /**
+     * Clean up resources. Call this when OrangeLinkImpl is no longer needed.
+     */
+    fun cleanup() {
+        stopScan()
+        handlerThread.quitSafely()
+    }
+
+    /**
+     * Stop scan and reset retry counter.
+     */
+    @SuppressLint("MissingPermission")
     fun stopScan() {
-        handler.removeMessages(TIME_OUT_WHAT)
+        aapsLogger.debug(LTag.PUMPBTCOMM, "Stopping scan (public)")
+        stopScanInternal()
+        scanRetryCount.set(0)
+    }
+
+    /**
+     * Internal stop without resetting retry counter.
+     */
+    @SuppressLint("MissingPermission")
+    private fun stopScanInternal() {
+        handler.removeMessages(MSG_TIMEOUT)
+        handler.removeMessages(MSG_RETRY)
 
         try {
-            if (isBluetoothAvailable())
+            if (isBluetoothAvailable()) {
                 rileyLinkBLE.bluetoothAdapter?.bluetoothLeScanner?.stopScan(scanCallback)
-
+                aapsLogger.debug(LTag.PUMPBTCOMM, "Scan stopped")
+            }
         } catch (e: Exception) {
-            aapsLogger.error(LTag.PUMPBTCOMM, "Stop scan: ${e.message}", e)
+            aapsLogger.debug(LTag.PUMPBTCOMM, "stopScan exception (may be expected): ${e.message}")
+        } finally {
+            isScanning.set(false)
         }
     }
 
     private fun isBluetoothAvailable(): Boolean =
-        rileyLinkBLE.bluetoothAdapter?.isEnabled == true && rileyLinkBLE.bluetoothAdapter?.state == BluetoothAdapter.STATE_ON
-
-    companion object {
-
-        const val TIME_OUT = 90 * 1000
-        const val TIME_OUT_WHAT = 0x12
-    }
+        rileyLinkBLE.bluetoothAdapter?.isEnabled == true &&
+        rileyLinkBLE.bluetoothAdapter?.state == BluetoothAdapter.STATE_ON
 }

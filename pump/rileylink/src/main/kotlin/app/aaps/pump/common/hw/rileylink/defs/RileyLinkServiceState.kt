@@ -53,6 +53,6 @@ enum class RileyLinkServiceState(var resourceId: Int) {
 
     fun isError(): Boolean =
         this == BluetoothError ||
-            // this == PumpConnectorError ||
+            this == PumpConnectorError ||
             this == RileyLinkError
 }

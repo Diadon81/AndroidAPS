@@ -10,10 +10,12 @@ import app.aaps.core.interfaces.logging.LTag
 import app.aaps.core.interfaces.plugin.ActivePlugin
 import app.aaps.core.keys.interfaces.Preferences
 import app.aaps.pump.common.hw.rileylink.RileyLinkConst
+import app.aaps.pump.common.hw.rileylink.ble.device.OrangeLinkImpl
 import app.aaps.pump.common.hw.rileylink.defs.RileyLinkError
 import app.aaps.pump.common.hw.rileylink.defs.RileyLinkPumpDevice
 import app.aaps.pump.common.hw.rileylink.defs.RileyLinkServiceState
 import app.aaps.pump.common.hw.rileylink.keys.RileyLinkStringPreferenceKey
+import app.aaps.pump.common.hw.rileylink.keys.RileylinkBooleanPreferenceKey
 import app.aaps.pump.common.hw.rileylink.service.tasks.DiscoverGattServicesTask
 import app.aaps.pump.common.hw.rileylink.service.tasks.InitializePumpManagerTask
 import app.aaps.pump.common.hw.rileylink.service.tasks.ServiceTask
@@ -23,6 +25,10 @@ import dagger.android.DaggerBroadcastReceiver
 import javax.inject.Inject
 import javax.inject.Provider
 
+/**
+ * Handles RileyLink/OrangeLink BLE connection events.
+ * Updated: Android 12-16 compatibility with reconnect callback support
+ */
 class RileyLinkBroadcastReceiver : DaggerBroadcastReceiver() {
 
     @Inject lateinit var preferences: Preferences
@@ -30,6 +36,7 @@ class RileyLinkBroadcastReceiver : DaggerBroadcastReceiver() {
     @Inject lateinit var rileyLinkServiceData: RileyLinkServiceData
     @Inject lateinit var serviceTaskExecutor: ServiceTaskExecutor
     @Inject lateinit var activePlugin: ActivePlugin
+    @Inject lateinit var orangeLink: OrangeLinkImpl
     @Inject lateinit var wakeAndTuneTaskProvider: Provider<WakeAndTuneTask>
     @Inject lateinit var initializePumpManagerTaskProvider: Provider<InitializePumpManagerTask>
     @Inject lateinit var discoverGattServicesTaskProvider: Provider<DiscoverGattServicesTask>
@@ -44,7 +51,6 @@ class RileyLinkBroadcastReceiver : DaggerBroadcastReceiver() {
         get() = (activePlugin.activePump as RileyLinkPumpDevice).rileyLinkService
 
     private fun createBroadcastIdentifiers() {
-
         // Bluetooth
         broadcastIdentifiers["Bluetooth"] = listOf(
             RileyLinkConst.Intents.BluetoothConnected,
@@ -61,7 +67,6 @@ class RileyLinkBroadcastReceiver : DaggerBroadcastReceiver() {
         broadcastIdentifiers["RileyLink"] = listOf(
             RileyLinkConst.Intents.RileyLinkDisconnected,
             RileyLinkConst.Intents.RileyLinkReady,
-            RileyLinkConst.Intents.RileyLinkDisconnected,
             RileyLinkConst.Intents.RileyLinkNewAddressSet,
             RileyLinkConst.Intents.RileyLinkDisconnect
         )
@@ -72,8 +77,11 @@ class RileyLinkBroadcastReceiver : DaggerBroadcastReceiver() {
         val action = intent.action ?: return
         Thread {
             aapsLogger.debug(LTag.PUMPBTCOMM, "Received Broadcast: $action")
-            if (!processBluetoothBroadcasts(action) && !processRileyLinkBroadcasts(action, context) && !processTuneUpBroadcasts(action))
+            if (!processBluetoothBroadcasts(action) &&
+                !processRileyLinkBroadcasts(action, context) &&
+                !processTuneUpBroadcasts(action)) {
                 aapsLogger.error(LTag.PUMPBTCOMM, "Unhandled broadcast: action=$action")
+            }
         }.start()
     }
 
@@ -92,19 +100,41 @@ class RileyLinkBroadcastReceiver : DaggerBroadcastReceiver() {
     private fun processRileyLinkBroadcasts(action: String, context: Context): Boolean =
         when (action) {
             RileyLinkConst.Intents.RileyLinkDisconnected  -> {
-                if ((context.getSystemService(Context.BLUETOOTH_SERVICE) as BluetoothManager).adapter.isEnabled)
-                    rileyLinkServiceData.setServiceState(RileyLinkServiceState.BluetoothError, RileyLinkError.RileyLinkUnreachable)
-                else
-                    rileyLinkServiceData.setServiceState(RileyLinkServiceState.BluetoothError, RileyLinkError.BluetoothDisabled)
+                aapsLogger.warn(LTag.PUMPBTCOMM, "RileyLink disconnected")
+
+                // Stop reader to allow clean restart on reconnect
+                rileyLinkService?.rfSpy?.stopReader()
+
+                val btManager = context.getSystemService(Context.BLUETOOTH_SERVICE) as BluetoothManager
+
+                if (btManager.adapter?.isEnabled == true) {
+                    rileyLinkServiceData.setServiceState(
+                        RileyLinkServiceState.BluetoothError,
+                        RileyLinkError.RileyLinkUnreachable
+                    )
+
+                    // Set up reconnect callback for scanning mode
+                    // This enables automatic rescan when autoConnect times out
+                    setupReconnectCallback()
+                } else {
+                    rileyLinkServiceData.setServiceState(
+                        RileyLinkServiceState.BluetoothError,
+                        RileyLinkError.BluetoothDisabled
+                    )
+                }
                 true
             }
 
             RileyLinkConst.Intents.RileyLinkReady         -> {
                 aapsLogger.warn(LTag.PUMPBTCOMM, "RileyLinkConst.Intents.RileyLinkReady")
-                // sendIPCNotification(RT2Const.IPC.MSG_note_WakingPump);
+
+                // Clear reconnect callback on successful connection
+                rileyLinkService?.rileyLinkBLE?.onReconnectNeeded = null
+
                 rileyLinkService?.rileyLinkBLE?.enableNotifications()
-                rileyLinkService?.rfSpy?.startReader() // call startReader from outside?
+                rileyLinkService?.rfSpy?.startReader()
                 rileyLinkService?.rfSpy?.initializeRileyLink()
+
                 val bleVersion = rileyLinkService?.rfSpy?.getBLEVersionCached()
                 val rlVersion = rileyLinkServiceData.firmwareVersion
                 aapsLogger.debug(LTag.PUMPBTCOMM, "RfSpy version (BLE113): $bleVersion")
@@ -112,16 +142,20 @@ class RileyLinkBroadcastReceiver : DaggerBroadcastReceiver() {
 
                 aapsLogger.debug(LTag.PUMPBTCOMM, "RfSpy Radio version (CC110): ${rlVersion?.name}")
                 rileyLinkServiceData.firmwareVersion = rlVersion
+
                 val task: ServiceTask = initializePumpManagerTaskProvider.get()
                 serviceTaskExecutor.startTask(task)
-                aapsLogger.info(LTag.PUMPBTCOMM, "Announcing RileyLink open For business")
+                aapsLogger.info(LTag.PUMPBTCOMM, "Announcing RileyLink open for business")
                 true
             }
 
             RileyLinkConst.Intents.RileyLinkNewAddressSet -> {
                 val rileylinkBLEAddress = preferences.get(RileyLinkStringPreferenceKey.MacAddress)
-                if (rileylinkBLEAddress == "") aapsLogger.error("No Rileylink BLE Address saved in app")
-                else rileyLinkService?.reconfigureRileyLink(rileylinkBLEAddress)
+                if (rileylinkBLEAddress == "") {
+                    aapsLogger.error("No RileyLink BLE Address saved in app")
+                } else {
+                    rileyLinkService?.reconfigureRileyLink(rileylinkBLEAddress)
+                }
                 true
             }
 
@@ -132,6 +166,26 @@ class RileyLinkBroadcastReceiver : DaggerBroadcastReceiver() {
 
             else                                          -> false
         }
+
+    /**
+     * Set up reconnect callback for scanning mode.
+     * When using OrangeLink with scanning, autoConnect may not work reliably
+     * on Android 12+. This callback triggers a rescan if needed.
+     */
+    private fun setupReconnectCallback() {
+        val useScanning = preferences.get(RileylinkBooleanPreferenceKey.OrangeUseScanning)
+
+        if (useScanning) {
+            aapsLogger.info(LTag.PUMPBTCOMM, "Scanning mode: setting up reconnect callback")
+            rileyLinkService?.rileyLinkBLE?.onReconnectNeeded = {
+                aapsLogger.info(LTag.PUMPBTCOMM, "Reconnect callback triggered - starting rescan")
+                orangeLink.startReconnectScan()
+            }
+        } else {
+            // For MAC mode, RileyLinkBLE handles reconnect internally
+            aapsLogger.debug(LTag.PUMPBTCOMM, "MAC mode: autoConnect will handle reconnection")
+        }
+    }
 
     private fun processBluetoothBroadcasts(action: String): Boolean =
         when (action) {
@@ -153,7 +207,9 @@ class RileyLinkBroadcastReceiver : DaggerBroadcastReceiver() {
 
     private fun processTuneUpBroadcasts(action: String): Boolean =
         if (broadcastIdentifiers["TuneUp"]?.contains(action) == true) {
-            if (rileyLinkServiceData.targetDevice.tuneUpEnabled) serviceTaskExecutor.startTask(wakeAndTuneTaskProvider.get())
+            if (rileyLinkServiceData.targetDevice.tuneUpEnabled) {
+                serviceTaskExecutor.startTask(wakeAndTuneTaskProvider.get())
+            }
             true
         } else false
 }

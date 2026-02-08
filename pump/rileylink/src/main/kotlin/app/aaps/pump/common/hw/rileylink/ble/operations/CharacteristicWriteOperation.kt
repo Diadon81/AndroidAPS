@@ -1,7 +1,9 @@
 package app.aaps.pump.common.hw.rileylink.ble.operations
 
+import android.annotation.SuppressLint
 import android.bluetooth.BluetoothGatt
 import android.bluetooth.BluetoothGattCharacteristic
+import android.os.Build
 import android.os.SystemClock
 import app.aaps.core.interfaces.logging.AAPSLogger
 import app.aaps.core.interfaces.logging.LTag
@@ -12,43 +14,85 @@ import java.util.concurrent.TimeUnit
 
 /**
  * Created by geoff on 5/26/16.
+ * Updated: Android 13+ (API 33) compatibility with new writeCharacteristic API
  */
-class CharacteristicWriteOperation(private val aapsLogger: AAPSLogger, val gatt: BluetoothGatt, val characteristic: BluetoothGattCharacteristic, value: ByteArray?) : BLECommOperation() {
+class CharacteristicWriteOperation(
+    private val aapsLogger: AAPSLogger,
+    private val gatt: BluetoothGatt,
+    private val characteristic: BluetoothGattCharacteristic,
+    value: ByteArray?,
+    gattOperationTimeoutMs: Int = DEFAULT_GATT_OPERATION_TIMEOUT_MS
+) : BLECommOperation(gattOperationTimeoutMs) {
 
     init {
         this.value = value
     }
 
-    @Suppress("deprecation")
+    @SuppressLint("MissingPermission")
     override fun execute(comm: RileyLinkBLE) {
-        characteristic.setValue(value)
-        gatt.writeCharacteristic(characteristic)
-        // wait here for callback to notify us that value was written.
+        val writeResult = performWrite()
+
+        // On Android 13+, writeCharacteristic returns result code immediately
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            if (writeResult != BluetoothGatt.GATT_SUCCESS) {
+                aapsLogger.error(LTag.PUMPBTCOMM,
+                    "writeCharacteristic failed immediately with code: $writeResult")
+                timedOut = true
+                return
+            }
+        } else {
+            // Legacy API returns boolean (mapped to GATT_SUCCESS/GATT_FAILURE)
+            if (writeResult != BluetoothGatt.GATT_SUCCESS) {
+                aapsLogger.error(LTag.PUMPBTCOMM, "writeCharacteristic failed to initiate")
+                timedOut = true
+                return
+            }
+        }
+
+        // Wait for callback
         try {
-            val didAcquire = operationComplete.tryAcquire(getGattOperationTimeout_ms().toLong(), TimeUnit.MILLISECONDS)
+            val didAcquire = operationComplete.tryAcquire(
+                getGattOperationTimeout_ms().toLong(),
+                TimeUnit.MILLISECONDS
+            )
             if (didAcquire) {
-                SystemClock.sleep(1) // This is to allow the IBinder thread to exit before we continue, allowing easier
-                // understanding of the sequence of events.
-                // success
+                SystemClock.sleep(1)
             } else {
-                aapsLogger.error(LTag.PUMPBTCOMM, "Timeout waiting for gatt write operation to complete")
+                aapsLogger.error(LTag.PUMPBTCOMM, "Timeout waiting for characteristic write callback")
                 timedOut = true
             }
         } catch (e: InterruptedException) {
-            aapsLogger.error(LTag.PUMPBTCOMM, "Interrupted while waiting for gatt write operation to complete")
+            aapsLogger.error(LTag.PUMPBTCOMM, "Interrupted waiting for characteristic write")
             interrupted = true
         }
     }
 
-    // This will be run on the IBinder thread
+    @SuppressLint("MissingPermission")
+    private fun performWrite(): Int {
+        return if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            // Android 13+ (API 33): new API with ByteArray parameter
+            gatt.writeCharacteristic(
+                characteristic,
+                value ?: ByteArray(0),
+                BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT
+            )
+        } else {
+            // Legacy API: set value then write
+            @Suppress("DEPRECATION")
+            characteristic.setValue(value)
+            @Suppress("DEPRECATION")
+            if (gatt.writeCharacteristic(characteristic)) {
+                BluetoothGatt.GATT_SUCCESS
+            } else {
+                BluetoothGatt.GATT_FAILURE
+            }
+        }
+    }
+
     override fun gattOperationCompletionCallback(uuid: UUID, value: ByteArray) {
         if (characteristic.uuid != uuid) {
-            aapsLogger.error(
-                LTag.PUMPBTCOMM, String.format(
-                    "Completion callback: UUID does not match! out of sequence? Found: %s, should be %s",
-                    lookup(characteristic.uuid), lookup(uuid)
-                )
-            )
+            aapsLogger.error(LTag.PUMPBTCOMM,
+                "Write callback UUID mismatch: expected ${lookup(characteristic.uuid)}, got ${lookup(uuid)}")
         }
         operationComplete.release()
     }

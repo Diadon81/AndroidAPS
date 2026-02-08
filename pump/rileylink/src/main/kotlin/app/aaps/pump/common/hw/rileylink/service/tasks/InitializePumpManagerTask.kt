@@ -30,6 +30,10 @@ class InitializePumpManagerTask @Inject constructor(
     override fun run() {
         if (!isRileyLinkDevice) return
 
+        // Reset tune-up state on new initialization
+        rileyLinkServiceData.tuneUpFailureCount = 0
+        rileyLinkServiceData.tuneUpInProgress.set(false)
+
         var lastGoodFrequency: Double
         if (rileyLinkServiceData.lastGoodFrequency == null) {
             lastGoodFrequency = preferences.get(RileyLinkDoubleKey.LastGoodDeviceFrequency)

@@ -11,6 +11,7 @@ import app.aaps.core.interfaces.resources.ResourceHelper
 import app.aaps.core.interfaces.rx.bus.RxBus
 import app.aaps.core.keys.interfaces.Preferences
 import app.aaps.pump.common.hw.rileylink.RileyLinkCommunicationManager
+import app.aaps.pump.common.hw.rileylink.RileyLinkConst
 import app.aaps.pump.common.hw.rileylink.RileyLinkUtil
 import app.aaps.pump.common.hw.rileylink.ble.RFSpy
 import app.aaps.pump.common.hw.rileylink.ble.RileyLinkBLE
@@ -18,6 +19,8 @@ import app.aaps.pump.common.hw.rileylink.ble.defs.RileyLinkEncodingType
 import app.aaps.pump.common.hw.rileylink.defs.RileyLinkError
 import app.aaps.pump.common.hw.rileylink.defs.RileyLinkServiceState
 import app.aaps.pump.common.hw.rileylink.keys.RileyLinkDoubleKey
+import android.os.Handler
+import android.os.Looper
 import dagger.android.DaggerService
 import java.util.Locale
 import javax.inject.Inject
@@ -125,23 +128,56 @@ abstract class RileyLinkService : DaggerService() {
 
     // FIXME: This needs to be run in a session so that is incorruptible, has a separate thread, etc.
     fun doTuneUpDevice() {
-        rileyLinkServiceData.setServiceState(RileyLinkServiceState.TuneUpDevice)
-        setPumpDeviceState(PumpDeviceState.Sleeping)
-        val lastGoodFrequency = rileyLinkServiceData.lastGoodFrequency ?: preferences.get(RileyLinkDoubleKey.LastGoodDeviceFrequency)
-        val newFrequency = deviceCommunicationManager.tuneForDevice()
-        if (newFrequency != 0.0 && newFrequency != lastGoodFrequency) {
-            aapsLogger.info(LTag.PUMPBTCOMM, String.format(Locale.ENGLISH, "Saving new pump frequency of %.3f MHz", newFrequency))
-            preferences.put(RileyLinkDoubleKey.LastGoodDeviceFrequency, newFrequency)
-            rileyLinkServiceData.lastGoodFrequency = newFrequency
-            rileyLinkServiceData.tuneUpDone = true
-            rileyLinkServiceData.lastTuneUpTime = System.currentTimeMillis()
+        if (!rileyLinkServiceData.tuneUpInProgress.compareAndSet(false, true)) {
+            aapsLogger.debug(LTag.PUMPBTCOMM, "Tune-up already in progress, skipping duplicate request")
+            return
         }
-        if (newFrequency == 0.0) {
-            // error tuning pump, pump not present ??
-            rileyLinkServiceData.setServiceState(RileyLinkServiceState.PumpConnectorError, RileyLinkError.TuneUpOfDeviceFailed)
-        } else {
-            deviceCommunicationManager.clearNotConnectedCount()
-            rileyLinkServiceData.setServiceState(RileyLinkServiceState.PumpConnectorReady)
+        try {
+            if (!rileyLinkBLE.isConnected) {
+                aapsLogger.warn(LTag.PUMPBTCOMM, "Cannot tune - BLE not connected")
+                rileyLinkServiceData.setServiceState(
+                    RileyLinkServiceState.RileyLinkError,
+                    RileyLinkError.RileyLinkUnreachable
+                )
+                return  // Background reconnect handles BLE recovery
+            }
+
+            rileyLinkServiceData.setServiceState(RileyLinkServiceState.TuneUpDevice)
+            setPumpDeviceState(PumpDeviceState.Sleeping)
+            val lastGoodFrequency = rileyLinkServiceData.lastGoodFrequency ?: preferences.get(RileyLinkDoubleKey.LastGoodDeviceFrequency)
+            val newFrequency = deviceCommunicationManager.tuneForDevice()
+            if (newFrequency != 0.0 && newFrequency != lastGoodFrequency) {
+                aapsLogger.info(LTag.PUMPBTCOMM, String.format(Locale.ENGLISH, "Saving new pump frequency of %.3f MHz", newFrequency))
+                preferences.put(RileyLinkDoubleKey.LastGoodDeviceFrequency, newFrequency)
+                rileyLinkServiceData.lastGoodFrequency = newFrequency
+                rileyLinkServiceData.tuneUpDone = true
+                rileyLinkServiceData.lastTuneUpTime = System.currentTimeMillis()
+            }
+            if (newFrequency == 0.0) {
+                // error tuning pump, pump not present
+                val failureCount = ++rileyLinkServiceData.tuneUpFailureCount
+                aapsLogger.warn(LTag.PUMPBTCOMM, "Pump tune-up failed (attempt $failureCount)")
+                rileyLinkServiceData.setServiceState(RileyLinkServiceState.PumpConnectorError, RileyLinkError.TuneUpOfDeviceFailed)
+
+                // Two-tier backoff: failures 1-3 use 15s/30s/60s, failures 4+ escalate to 2min/3min/5min cap
+                val delay = if (failureCount <= 3) {
+                    // First 3 failures: 15s → 30s → 60s
+                    (15_000L * (1 shl (failureCount - 1).coerceAtMost(2))).coerceAtMost(60_000L)
+                } else {
+                    // Sustained failures: 2min → 3min → 5min (cap)
+                    (60_000L * (failureCount - 2).coerceAtMost(5)).coerceAtMost(300_000L)
+                }
+                aapsLogger.info(LTag.PUMPBTCOMM, "Scheduling tune-up retry in ${delay / 1000}s")
+                Handler(Looper.getMainLooper()).postDelayed({
+                    rileyLinkUtil.sendBroadcastMessage(RileyLinkConst.IPC.MSG_PUMP_tunePump)
+                }, delay)
+            } else {
+                rileyLinkServiceData.tuneUpFailureCount = 0  // Reset on success
+                deviceCommunicationManager.clearNotConnectedCount()
+                rileyLinkServiceData.setServiceState(RileyLinkServiceState.PumpConnectorReady)
+            }
+        } finally {
+            rileyLinkServiceData.tuneUpInProgress.set(false)
         }
     }
 
